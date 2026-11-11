@@ -42,24 +42,27 @@ There is no mode to switch.
 Add this as a module in TizenBrew:
 
 ```
-gh/yankygdev-design/mbp-native-player-dist@v0.4.0
+gh/yankygdev-design/mbp-native-player-dist@v0.4.1
 ```
 
-**Use a tag, not a branch.** jsDelivr caches a `@main` URL for hours, so after
-an update a branch URL can keep serving the previous build — and you end up
-testing code that no longer exists. A tag is cached permanently and is always
-the build you asked for.
+**Use a tag, not a branch.** jsDelivr's documentation puts branch caching at
+**12 hours**, so after an update a `@main` URL can keep serving the previous
+build — and you end up testing code that no longer exists. A version URL is
+cached, in their words, "effectively forever".
 
 The flip side is worth knowing: a tag is immutable, not current. If a tag is
 older than the work, it serves the older work. The **Blue** screen shows the
 version and build id actually running, so check there before believing
 anything about what is installed.
 
-If you do pin to a branch and need the cache cleared:
-
-```
-https://purge.jsdelivr.net/gh/yankygdev-design/mbp-native-player-dist@main/userScript.js
-```
+**Permanence cuts deeper than cache.** jsDelivr stores fetched files
+permanently and states that a version URL cannot be updated once downloaded,
+that purging "does not affect exact-version links", and that files stay
+available even if the repository or release is deleted. So a published tag is
+effectively final: the way to correct a release is to publish a new one, not
+to try to withdraw the old. Their purge tool is for branch and alias URLs,
+documents semver as a requirement, and grants access on request rather than
+openly.
 
 ## Keys
 

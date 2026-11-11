@@ -45,12 +45,12 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.4.0';
+  var BUILD_VERSION = '0.4.1';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
   // which is itself worth seeing on the diagnostics screen.
-  var BUILD_SHA = '51e002f';
+  var BUILD_SHA = '2d4a442';
   var BUILD_SRC = (function () {
     try {
       var s = D.currentScript;
@@ -65,11 +65,24 @@
   })();
 
   var CFG = {
-    // A movie's file id goes in `mfid`, an episode's in `tfid`. They are
-    // different parameters on the same endpoint, so the kind must travel with
-    // the id -- a client that only knows tfid cannot open a film at all.
-    open: { kind: (/[?&]movie=1/.test(location.search) ? 'movie' : 'tv'),
-            id: (/[?&]movie=1/.test(location.search) ? 990001 : 2480113) },
+    // What a (re)fetch should ask for. A movie's file id goes in `mfid`, an
+    // episode's in `tfid` -- different parameters on the same endpoint, so the
+    // kind must travel with the id; a client that only knows tfid cannot open
+    // a film at all.
+    //
+    // DELIBERATELY EMPTY, and it must stay that way. Two reasons:
+    //
+    //  - No real resource id belongs in a file that executes. This slice is
+    //    published, and a baked id is the user's library by implication. It is
+    //    also how a placeholder quietly becomes a live call against a real
+    //    title. (Two 7-digit ids used to sit here. Neither could be traced
+    //    back to a capture afterwards, which is the whole argument: a bare
+    //    integer literal keeps no provenance.)
+    //  - Nothing needs it. The dev hatch carries its own id in the URL
+    //    (`?mbpopen=tv:<id>`), and the normal path learns the id from the
+    //    player page in `start()`. An id here would only ever be a wrong
+    //    answer waiting to be used -- see the guard in `refreshLink`.
+    open: { kind: null, id: null },
     // Deliberately conservative, and the reason is measured rather than
     // cautious by temperament. A codec string from canPlayType is the decoder
     // SAYING it can, which is not evidence that it does: project 1 climbed to
@@ -242,6 +255,29 @@
     return out;
   }
 
+  // What a refresh has to re-request. NOT `tid` or `mid`: those are title ids
+  // in a different space from the file ids the player endpoint takes, and
+  // sending one where the other belongs is a silent wrong answer.
+  //
+  // `pfid` is preferred because it names its own parameter ("tfid=NNN"), so
+  // the kind travels with the value instead of being inferred.
+  // `currentResourceFid` is the fallback, with the kind from the tid test.
+  //
+  // Both are recorded as present on the player page in MILESTONE-1.md and are
+  // reproduced in the fixture -- but neither is re-verifiable here without a
+  // real player page, and the fixture is my own construction, so it cannot be
+  // evidence for what the real page holds. **Returning null is therefore a
+  // supported answer, and every caller must handle it.** Declining to refresh
+  // is correct; refreshing the wrong title is not.
+  function fetchTarget(pfid, fid, tid) {
+    var m = /^\s*(tfid|mfid)\s*=\s*(\d+)\s*$/.exec(String(pfid == null ? '' : pfid));
+    if (m) return { kind: m[1] === 'mfid' ? 'movie' : 'tv', id: m[2] };
+    if (fid != null && String(fid) !== '' && /^\d+$/.test(String(fid))) {
+      return { kind: tid ? 'tv' : 'movie', id: String(fid) };
+    }
+    return null;
+  }
+
   function parsePlayerPageInner(html) {
     var v = collectVars(html);                  // the only full pass for scalars
     function s(name) { return scalarAt(html, v[name]); }
@@ -261,8 +297,12 @@
       mp4Id: s('mp4_id'),
       title: s('mbpPlayerTitle') || 'MovieBoxPro',
       skips: s('skips'),
-      // A series page carries `tid`; a film page carries `mid`.
-      kind: tid ? 'tv' : 'movie'
+      // A series page carries `tid`; a film page carries `mid`. Confirmed
+      // against the live site on 11 Nov 2026: `mid` present and `tid`
+      // verified absent on a film page (SITE-MARKUP.md).
+      kind: tid ? 'tv' : 'movie',
+      // May be null. See fetchTarget.
+      target: fetchTarget(s('pfid'), s('currentResourceFid'), tid)
     };
   }
 
@@ -779,6 +819,18 @@
   // responses.
   function refreshLink(reason) {
     if (state.recovering) return;
+    // No file id for what is playing: the player page carried neither `pfid`
+    // nor `currentResourceFid` and nothing forced one. There is nothing safe
+    // to fetch -- a guess would start a different title at this timestamp --
+    // so say so and stop asking. needsRefresh is cleared because the
+    // heartbeat and the `online` handler would otherwise re-enter here
+    // forever.
+    if (!CFG.open || !CFG.open.id) {
+      state.needsRefresh = false;
+      showMsg(el('div', 'font-size:22px;font-weight:600', 'Cannot refresh this link'),
+              el('div', 'color:#8fa3b8', 'Press Back and open the title again to carry on.'));
+      return;
+    }
     var now = Date.now();
     if (state.lastRecover && now - state.lastRecover < 15000) return;  // no loops
     state.recovering = true;
@@ -972,6 +1024,13 @@
     var d = parsePlayerPage(html);
     state.data = d;
     if (!d.quality.length) { showMsg('No playable rungs in the player page.'); return; }
+
+    // Keep the refresh target pointing at what is actually playing. Without
+    // this, CFG.open still held whatever boot put there, and refreshLink --
+    // the sleep/wake, source-error and stall-escalation path -- re-fetched
+    // THAT. On the normal takeover path, where nothing ever set it, waking
+    // the TV would load a different title than the one on screen.
+    if (d.target) CFG.open = d.target;
 
     // start() re-runs on every episode change, and the subtitle list belongs
     // to the old episode. Leaving the panel open would show stale rows and
@@ -1355,7 +1414,9 @@
       }
     }
 
-    if (CFG.open.kind === 'tv') {
+    // The PARSED kind, not CFG.open's. CFG.open is a fetch target and starts
+    // empty; reading the kind off it showed a Next-episode row on films.
+    if (state.data && state.data.kind === 'tv') {
       rows.push({ label: 'Next episode', value: 'OK',
                   ok: function () { closeSettings(); playNext(); } });
     }
@@ -2186,7 +2247,9 @@
     state.tookOver = true;
     marks.takeoverAt = now();
     showMsg(el('div', 'font-size:26px;font-weight:600', 'MBP Native Player'),
-            el('div', 'color:#8fa3b8', 'Loading ' + CFG.open.kind + ' ' + CFG.open.id + '...'));
+            el('div', 'color:#8fa3b8', CFG.open && CFG.open.id
+                ? ('Loading ' + CFG.open.kind + ' ' + CFG.open.id + '...')
+                : 'Loading...'));
 
     function load() {
       return fetchPlayer(CFG.open, 0).then(start);
@@ -2262,6 +2325,8 @@
     isUnauthenticated: isUnauthenticated,
     extractPairCode: extractPairCode,
     secondsUntilExpiry: secondsUntilExpiry,
+    fetchTarget: fetchTarget,
+    CFG: CFG,
     state: state,
     parsePlayerPage: parsePlayerPage,
     playerDataInPage: playerDataInPage,
