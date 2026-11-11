@@ -45,12 +45,12 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.4.1';
+  var BUILD_VERSION = '0.4.2';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
   // which is itself worth seeing on the diagnostics screen.
-  var BUILD_SHA = 'e7af54c';
+  var BUILD_SHA = '96a10d4';
   var BUILD_SRC = (function () {
     try {
       var s = D.currentScript;
@@ -1762,9 +1762,63 @@
     add(NAV_SEMANTIC, false);
     add(NAV_EXTRA, false);
     add(NAV_POINTER_TAGS, true);
+    list = navCollapseDuplicateLinks(list, stamp);
     nav.harvestMs = now() - t0;
     nav.harvestN = list.length;
     return list;
+  }
+
+  // Two anchors to the same place inside one container is one of the most
+  // common patterns on the web -- a thumbnail link beside a title link -- and
+  // it doubles the presses needed to cross a list. Confirmed in this site's
+  // real markup: each `div.tv_episode` holds
+  //
+  //   <a class="start_app_episode"           href=X tid= season= episode= play=>
+  //   <a class="start_app_episode watch_tab" href=X tid= season= episode= play=>
+  //
+  // Same href, same episode, same handler. Without this, a 20-episode season
+  // costs 40 stops and every second one is a repeat.
+  //
+  // The existing duplicate check does not reach these: it lives in the
+  // cursor:pointer sweep and tests the PARENT, which catches a button wrapped
+  // round its own label but not two siblings.
+  //
+  // Three deliberate limits, because this only ever REMOVES focus stops and a
+  // wrong removal makes something unreachable:
+  //  - anchors only, and only with the same non-empty href. A different href
+  //    is a different destination and both must stay.
+  //  - same parent only. Two links to one place in different parts of a page
+  //    are genuinely two routes there.
+  //  - placeholder hrefs are never keys. `javascript:;` and `#` are shared by
+  //    unrelated buttons all over this site -- the film's own Play button is
+  //    `href="javascript:;"` -- so keying on them would collapse controls that
+  //    have nothing to do with each other. That would be the dead-remote bug
+  //    this navigation exists to avoid, caused by the fix for a lesser one.
+  //
+  // The survivor is the LARGER of the two, since the focus ring is easier to
+  // see on it. Rects are measured only when a collision is found, so the
+  // common path adds no layout reads -- the thing that would actually cost
+  // something on a TV CPU.
+  function navCollapseDuplicateLinks(list, stamp) {
+    var byKey = {}, out = [], pid = 0, i, n, href, p, key, at, cur;
+    function area(el) {
+      try { var r = el.getBoundingClientRect(); return (r.width || 0) * (r.height || 0); }
+      catch (e) { return 0; }
+    }
+    for (i = 0; i < list.length; i++) {
+      n = list[i];
+      href = (n.tagName && n.tagName.toUpperCase() === 'A')
+        ? String(n.getAttribute('href') || '') : '';
+      p = n.parentElement;
+      if (!href || !p || /^\s*(javascript:|#)/i.test(href)) { out.push(n); continue; }
+      if (p.__navDupAt !== stamp) { p.__navDupAt = stamp; p.__navDupId = ++pid; }
+      key = p.__navDupId + '|' + href;
+      at = byKey[key];
+      if (at == null) { byKey[key] = out.length; out.push(n); continue; }
+      cur = out[at];
+      if (area(n) > area(cur)) out[at] = n;        // keep the bigger target
+    }
+    return out;
   }
 
   function navCandidates() {
@@ -2289,6 +2343,7 @@
     // navigation, so the fixture can drive the D-pad without a remote
     nav: nav,
     navCandidates: navCandidates,
+    navCollapseDuplicateLinks: navCollapseDuplicateLinks,
     navMove: navMove,
     navActivate: navActivate,
     navSetFocus: navSetFocus,

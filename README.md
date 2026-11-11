@@ -42,7 +42,7 @@ There is no mode to switch.
 Add this as a module in TizenBrew:
 
 ```
-gh/yankygdev-design/mbp-native-player-dist@v0.4.1
+gh/yankygdev-design/mbp-native-player-dist@v0.4.2
 ```
 
 **Use a tag, not a branch.** jsDelivr's documentation puts branch caching at
