@@ -29,8 +29,11 @@ There is no mode to switch.
 - **Next episode** on Yellow, and automatically when one ends
 - **Resume across standby** — detects the set having slept and refreshes an
   expired stream link rather than leaving a dead player
-- **Page size** on Blue, because the site caps itself at 750px wide and
-  renders tiny on a 1080p panel
+- **Page size** on Blue. The site caps its own layout at 750px wide, and this
+  lifts that cap — but only partly, and how much is still unmeasured.
+  Its stylesheet specifies about three quarters of its sizes in plain `px`,
+  which no root font size can move, so expect this to change some of the page
+  and not all of it. 100% leaves the site completely alone
 - **Diagnostics** on Blue during playback: engine version, timings, dropped
   frames and codec support, on one screen
 
