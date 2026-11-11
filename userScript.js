@@ -45,12 +45,12 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.2.0';
+  var BUILD_VERSION = '0.3.0';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
   // which is itself worth seeing on the diagnostics screen.
-  var BUILD_SHA = 'eb2db89';
+  var BUILD_SHA = '18ef0b2';
   var BUILD_SRC = (function () {
     try {
       var s = D.currentScript;
@@ -1398,6 +1398,484 @@
     else if (a === 'back') { saveProgress(); try { W.location.href = '/'; } catch (err) {} }
   }
 
+  /* ================================================================ navigation
+   * D-pad navigation over the site's OWN pages: sign-in, browse, search and
+   * opening a title.
+   *
+   * Why this has to exist. The player wakes only once a page already contains
+   * the site's player script, and on a TV nothing can put one there:
+   * TizenBrew runs one module at a time, so the module that could navigate is
+   * not running. Measured on hardware -- with this module enabled the user
+   * reached the signed-out gate page and reported no selectable element at
+   * all, up and down merely scrolling the page. The player was never
+   * unreachable because of a bug; it was unreachable because nothing could
+   * reach it.
+   *
+   * Lifted from MBP-STV (same author, MIT) rather than rediscovered, because
+   * the parts that matter are the ones that took real pages to find:
+   *   - the explicit selector set. This site makes things clickable with a
+   *     jQuery handler bound to an <img>: no href, no onclick, no tabindex,
+   *     computed cursor:auto. No generic focusable sweep can see them, which
+   *     is why a signed-out screen offers the Google button and nothing else.
+   *   - the direction scoring in navFindNext, which has to cope with a phone
+   *     layout stretched across a 16:9 panel.
+   *   - the page-scale fix, and the two traps in it recorded below.
+   *
+   * How it hands over to the player: by doing nothing special. It clicks the
+   * title, the site loads its own player, playerDataInPage() sees the script
+   * and takeOver() runs. There is no mode for anyone to understand or switch,
+   * and no second code path -- the handover is the one already there.
+   */
+  var NAV_SEMANTIC = 'a[href],button,input,select,textarea,summary,[tabindex],' +
+    '[onclick],[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="option"]';
+
+  // Clickable on this site through a jQuery handler and nothing else.
+  // '.login_more img' is the one that matters most: it reveals QR and code
+  // sign-in on the gate page, and the handler is bound to the image rather
+  // than the <p>, which spans the whole row.
+  var NAV_EXTRA = [
+    // The IMG only, never the <p>. Measured on the fixture: the <p> is
+    // 1291px wide and the img 154px at its left edge, so a click aimed at
+    // the <p>'s centre lands on the <p> -- which carries no handler. Listing
+    // the <p> put a selectable item on the gate page that did nothing when
+    // you pressed OK, which is precisely the dead-remote feel this whole
+    // change exists to remove. Project 1's selector set says the same thing
+    // in a comment; I added both anyway and the fixture caught it.
+    '.login_more img',
+    '.left', '.left_show', '.right', '.right2', '.right_show', '.lower',
+    '.filter', '.elect', '.elected', '.operation', '.tab_con li',
+    '.watch_plan', '.favorite', '.comment', '.like2', '.dislike',
+    '.open2', '.hide', '.lang_btn', '.lang_list p', '.sidebarbg2 li',
+    '.episode', '.spread_episode', '.off_episode', '.popup_close', '.fav_close',
+    '.tips_close', '.search_close', '.search_submit', '.search_submit2',
+    '.letter_list a', '.sort', '.back', '.more', '.watch_status',
+    '.operation_list p', '.play_btn', '.start_app', '.season_info .episode'
+  ].join(',');
+
+  // Divs and spans that only admit to being buttons through cursor:pointer.
+  // The style lookup is the expensive part, so this sweep is bounded to near
+  // the viewport -- see navHarvest.
+  var NAV_POINTER_TAGS = 'div,span,li,p,img,td,h1,h2,h3,h4,label,i,b,strong,em';
+
+  var nav = {
+    on: false, focus: null, ring: null, scaleEl: null, help: null,
+    stamp: 0, cache: null, cacheAt: 0, cacheY: 0, dirty: true,
+    lastMove: 0, obs: null, pick: null, scrollFn: null, resizeFn: null,
+    harvestMs: 0, harvestN: 0
+  };
+
+  function navRect(n) {
+    var r = n.getBoundingClientRect();
+    return { l: r.left, t: r.top, r: r.right, b: r.bottom, w: r.width, h: r.height };
+  }
+  function navCss(n) { return W.getComputedStyle(n) || {}; }
+  function navAttached(n) { return !!n && n.nodeType === 1 && D.documentElement.contains(n); }
+  function navMine(n) {
+    if (typeof ui !== 'undefined' && ui && ui.root && ui.root.contains(n)) return true;
+    if (nav.ring && nav.ring === n) return true;
+    if (nav.help && nav.help.contains && nav.help.contains(n)) return true;
+    return false;
+  }
+  function navHiddenUp(n) {
+    while (n && n.nodeType === 1) {
+      var s = navCss(n);
+      if (s.display === 'none' || parseFloat(s.opacity) < 0.05) return true;
+      n = n.parentElement;
+    }
+    return false;
+  }
+  function navShown(n, r) {
+    r = r || navRect(n);
+    if (r.w < 4 || r.h < 4) return false;
+    var v = navCss(n).visibility;
+    if (v === 'hidden' || v === 'collapse') return false;
+    return !navHiddenUp(n);
+  }
+
+  function navHarvest() {
+    var t0 = now(), list = [], stamp = ++nav.stamp, vh = W.innerHeight;
+    function add(sel, needPointer) {
+      var els, i, n, r, p;
+      try { els = D.querySelectorAll(sel); } catch (err) { return; }
+      for (i = 0; i < els.length; i++) {
+        n = els[i];
+        if (n.__navAt === stamp || navMine(n)) continue;
+        if (needPointer) {
+          // Bounded on purpose: a style lookup for every div on a catalogue
+          // page is the one thing here that could be slow on a TV CPU.
+          r = n.getBoundingClientRect();
+          if (r.width < 10 || r.height < 10) continue;
+          if (r.bottom < -vh * 1.5 || r.top > vh * 2.5) continue;
+          if (navCss(n).cursor !== 'pointer') continue;
+          p = n.parentElement;
+          if (p && navCss(p).cursor === 'pointer') continue;   // same button twice
+        }
+        n.__navAt = stamp;
+        list.push(n);
+      }
+    }
+    add(NAV_SEMANTIC, false);
+    add(NAV_EXTRA, false);
+    add(NAV_POINTER_TAGS, true);
+    nav.harvestMs = now() - t0;
+    nav.harvestN = list.length;
+    return list;
+  }
+
+  function navCandidates() {
+    var y = W.pageYOffset;
+    var fresh = nav.cache && !nav.dirty &&
+      Math.abs(y - nav.cacheY) < W.innerHeight * 0.5 && now() - nav.cacheAt < 4000;
+    if (!fresh) {
+      nav.cache = navHarvest();
+      nav.cacheAt = now(); nav.cacheY = y; nav.dirty = false;
+    }
+    var out = [], vh = W.innerHeight, vw = W.innerWidth, i, n, r;
+    for (i = 0; i < nav.cache.length; i++) {
+      n = nav.cache[i];
+      if (!navAttached(n)) continue;
+      r = navRect(n);
+      if (r.w < 4 || r.h < 4) continue;
+      if (r.b < -vh || r.t > vh * 2 || r.r < 0 || r.l > vw) continue;
+      if (!navShown(n, r)) continue;
+      out.push({ el: n, r: r });
+    }
+    return out;
+  }
+
+  // Direction scoring, lifted. Left/Right stay on the same row; Up/Down prefer
+  // the same column, then fall back to anything below or above, so you can
+  // always get out of a header or a short row.
+  function navFindNext(cur, dir, cands) {
+    var c = navRect(cur), ccx = c.l + c.w / 2, ccy = c.t + c.h / 2;
+    var horiz = dir === 'left' || dir === 'right';
+    var best = [null, null], bestScore = [Infinity, Infinity], i;
+    for (i = 0; i < cands.length; i++) {
+      var n = cands[i].el, r = cands[i].r;
+      if (n === cur || n.contains(cur) || cur.contains(n)) continue;
+      var cx = r.l + r.w / 2, cy = r.t + r.h / 2, primary, overlap;
+      if (dir === 'right') {
+        if (r.l < c.r - 4 && !(cx > c.r && r.l > c.l + 4)) continue;
+        primary = Math.max(0, r.l - c.r);
+        overlap = Math.min(c.b, r.b) - Math.max(c.t, r.t);
+      } else if (dir === 'left') {
+        if (r.r > c.l + 4 && !(cx < c.l && r.r < c.r - 4)) continue;
+        primary = Math.max(0, c.l - r.r);
+        overlap = Math.min(c.b, r.b) - Math.max(c.t, r.t);
+      } else if (dir === 'down') {
+        if (r.t < c.b - 4 && !(cy > c.b && r.t > c.t + 4)) continue;
+        primary = Math.max(0, r.t - c.b);
+        overlap = Math.min(c.r, r.r) - Math.max(c.l, r.l);
+      } else {
+        if (r.b > c.t + 4 && !(cy < c.t && r.b < c.b - 4)) continue;
+        primary = Math.max(0, c.t - r.b);
+        overlap = Math.min(c.r, r.r) - Math.max(c.l, r.l);
+      }
+      var ortho = overlap > 0 ? 0 : -overlap;
+      var dPri = horiz ? Math.abs(cx - ccx) : Math.abs(cy - ccy);
+      var dOrt = horiz ? Math.abs(cy - ccy) : Math.abs(cx - ccx);
+      var tier;
+      if (horiz) {
+        if (!(overlap > 0 || ortho <= Math.max(20, c.h * 0.5))) continue;
+        tier = 0;
+      } else {
+        tier = (overlap > 0 || dPri >= dOrt * 0.3) ? 0 : 1;
+      }
+      var score = primary + ortho * 4 + dOrt * 0.15 -
+        (overlap > 0 ? Math.min(overlap, 40) * 0.5 : 0);
+      if (score < bestScore[tier]) { bestScore[tier] = score; best[tier] = n; }
+    }
+    return best[0] || best[1];
+  }
+
+  function navPickFirst(cands) {
+    var best = null, bs = Infinity, i, c, score;
+    for (i = 0; i < cands.length; i++) {
+      c = cands[i];
+      if (c.r.b < 0 || c.r.t > W.innerHeight) continue;
+      score = c.r.t * 2 + c.r.l;
+      if (score < bs) { bs = score; best = c.el; }
+    }
+    return best || (cands[0] ? cands[0].el : null);
+  }
+
+  // ---------------------------------------------------------------- ring
+  function navRingEl() {
+    if (nav.ring && navAttached(nav.ring)) return nav.ring;
+    var r = D.createElement('div');
+    r.setAttribute('data-mbp-nav', 'ring');
+    r.style.cssText = 'position:fixed;z-index:2147483646;pointer-events:none;' +
+      'border:4px solid #3ea6ff;border-radius:8px;display:none;' +
+      'box-shadow:0 0 0 3px rgba(0,0,0,.55),0 0 18px rgba(62,166,255,.85);';
+    (D.body || D.documentElement).appendChild(r);
+    nav.ring = r;
+    return r;
+  }
+  function navDrawRing() {
+    var r = navRingEl();
+    if (!nav.on || !nav.focus || !navAttached(nav.focus) || !navShown(nav.focus)) {
+      r.style.display = 'none';
+      return;
+    }
+    var b = navRect(nav.focus);
+    r.style.display = 'block';
+    r.style.left = Math.round(b.l - 3) + 'px';
+    r.style.top = Math.round(b.t - 3) + 'px';
+    r.style.width = Math.round(b.w + 6) + 'px';
+    r.style.height = Math.round(b.h + 6) + 'px';
+  }
+
+  // ---------------------------------------------------------------- clicking
+  function navFire(n, type, x, y) {
+    var ev, init = { bubbles: true, cancelable: true, view: W,
+      clientX: x, clientY: y, screenX: x, screenY: y,
+      button: 0, buttons: /down/.test(type) ? 1 : 0 };
+    if (type.indexOf('pointer') === 0) {
+      init.pointerId = 1; init.pointerType = 'mouse'; init.isPrimary = true;
+      try { ev = new W.PointerEvent(type, init); } catch (e) { return; }
+    } else {
+      try { ev = new W.MouseEvent(type, init); } catch (e2) { return; }
+    }
+    try { n.dispatchEvent(ev); } catch (e3) {}
+  }
+  function navHover(n) {
+    var r = navRect(n), x = r.l + r.w / 2, y = r.t + r.h / 2;
+    navFire(n, 'pointerover', x, y);
+    navFire(n, 'mouseover', x, y);
+    navFire(n, 'mousemove', x, y);
+  }
+  function navClick(n) {
+    if (!n || !navAttached(n)) return;
+    var r = navRect(n), x = r.l + r.w / 2, y = r.t + r.h / 2, t = n;
+    // Aim at the innermost child under the centre, so a handler bound to a
+    // child of what we focused still sees the click.
+    try {
+      var hit = D.elementFromPoint(x, y);
+      if (hit && hit !== n && n.contains(hit)) t = hit;
+    } catch (e) {}
+    navFire(t, 'pointerover', x, y); navFire(t, 'mouseover', x, y);
+    navFire(t, 'pointerdown', x, y); navFire(t, 'mousedown', x, y);
+    navFire(t, 'pointerup', x, y);   navFire(t, 'mouseup', x, y);
+    if (t === n && typeof n.click === 'function' &&
+        /^(A|BUTTON|INPUT|SUMMARY|LABEL)$/.test(n.tagName)) n.click();
+    else navFire(t, 'click', x, y);
+  }
+  function navTyping() {
+    var a = D.activeElement;
+    if (!a || a === D.body) return false;
+    if (a.isContentEditable || a.tagName === 'TEXTAREA') return true;
+    if (a.tagName !== 'INPUT') return false;
+    return /^(text|search|email|password|number|tel|url)$/.test((a.type || 'text').toLowerCase());
+  }
+  function navSetFocus(n) {
+    if (!n) return;
+    nav.focus = n;
+    try { n.scrollIntoView({ block: 'center', inline: 'nearest' }); }
+    catch (e) { try { n.scrollIntoView(); } catch (e2) {} }
+    navHover(n);
+    if (/^(A|BUTTON)$/.test(n.tagName)) { try { n.focus({ preventScroll: true }); } catch (e3) {} }
+    navDrawRing();
+  }
+  function navMove(dir) {
+    if (now() - nav.lastMove < 80) return;
+    nav.lastMove = now();
+    var cands = navCandidates();
+    if (!cands.length) { navScroll(dir); return; }
+    var cur = nav.focus && navAttached(nav.focus) && navShown(nav.focus) ? nav.focus : null;
+    if (!cur) { navSetFocus(navPickFirst(cands)); return; }
+    var next = navFindNext(cur, dir, cands);
+    if (next) navSetFocus(next);
+    else navScroll(dir);    // nothing that way: pan the page rather than dead-end
+  }
+  function navScroll(dir) {
+    if (dir !== 'up' && dir !== 'down') return;
+    W.scrollBy(0, (dir === 'down' ? 1 : -1) * Math.round(W.innerHeight * 0.4));
+    nav.dirty = true;
+    navDrawRing();
+  }
+  function navActivate(n) {
+    if (!n || !navAttached(n)) return;
+    var tag = n.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || n.isContentEditable) {
+      if (/^(checkbox|radio|submit|button|reset|image)$/i.test(n.type || '')) { navClick(n); return; }
+      try { n.focus(); } catch (e) {}       // the set's own keyboard comes up
+      return;
+    }
+    if (tag === 'A') {
+      var tg = n.getAttribute('target');
+      if (tg && tg !== '_self') n.setAttribute('target', '_self');  // a new tab is unreachable here
+    }
+    nav.dirty = true;
+    navClick(n);
+    setTimeout(function () { nav.dirty = true; navDrawRing(); }, 400);
+  }
+
+  // ---------------------------------------------------------------- page scale
+  // The site is a 750px phone design: its own index.js does
+  //   var w = innerWidth; if (w > 750) w = 750;  html.style.fontSize = w / 7.5
+  // so on a 1920 panel the page renders 750px wide and everything is tiny.
+  // This re-does that sum without the cap.
+  //
+  // Two traps, both already paid for:
+  //   - it must be a STYLESHEET rule carrying !important. The site re-applies
+  //     its inline font-size on resize, and an inline value loses to nothing
+  //     short of an !important rule.
+  //   - do NOT use CSS zoom. Measured on this site, getBoundingClientRect
+  //     reports unzoomed coordinates while elementFromPoint wants visual
+  //     pixels, so every synthetic click's hit test returns null and nothing
+  //     is clickable at all.
+  var NAV_SCALE_KEY = 'mbp_scale', NAV_SCALE_MIN = 0.5, NAV_SCALE_MAX = 1.4;
+  function navScaleClamp(v) {
+    return Math.max(NAV_SCALE_MIN, Math.min(NAV_SCALE_MAX, Math.round(v * 20) / 20));
+  }
+  function navScaleGet() {
+    var v = NaN;
+    try { v = parseFloat(W.localStorage.getItem(NAV_SCALE_KEY)); } catch (e) {}
+    return navScaleClamp(v > 0 ? v : 1);    // 1 == the design filling the screen width
+  }
+  function navScaleApply() {
+    var px = (W.innerWidth / 7.5) * navScaleGet();
+    if (!(px > 0)) return;                  // a zero-width viewport: leave the site alone
+    if (!nav.scaleEl || !navAttached(nav.scaleEl)) {
+      nav.scaleEl = D.createElement('style');
+      nav.scaleEl.setAttribute('data-mbp-nav', 'scale');
+      (D.head || D.documentElement).appendChild(nav.scaleEl);
+    }
+    var want = 'html{font-size:' + px.toFixed(2) + 'px !important;}';
+    if (nav.scaleEl.textContent !== want) { nav.scaleEl.textContent = want; nav.dirty = true; }
+  }
+  function navScaleNudge(dir) {
+    var v = navScaleClamp(navScaleGet() + dir * 0.05);
+    try { W.localStorage.setItem(NAV_SCALE_KEY, String(v)); } catch (e) {}
+    navScaleApply();
+    nav.dirty = true;
+    navRenderHelp();
+    setTimeout(function () { nav.dirty = true; navDrawRing(); }, 60);
+    return v;
+  }
+
+  // ---------------------------------------------------------------- help card
+  // One key, and it says what every other key does. The colour keys are
+  // otherwise undiscoverable without the README, which is no use on a sofa.
+  function navRenderHelp() {
+    if (!nav.help) return;
+    var rows = [
+      ['Up / Down / Left / Right', 'Move the selection'],
+      ['OK', 'Open what is selected'],
+      ['Back', 'Back a page'],
+      ['Blue', 'This screen'],
+      ['', ''],
+      ['Screen size', Math.round(navScaleGet() * 100) + '%   ◀  ▶']
+    ], h = '', i;
+    h += '<div style="font-size:30px;font-weight:600;margin-bottom:18px">Remote keys</div>';
+    for (i = 0; i < rows.length; i++) {
+      if (!rows[i][0]) { h += '<div style="height:14px"></div>'; continue; }
+      h += '<div style="display:flex;margin:9px 0;font-size:23px;line-height:1.35">' +
+        '<div style="flex:0 0 330px;color:#8fa3b8">' + rows[i][0] + '</div>' +
+        '<div style="color:#fff">' + rows[i][1] + '</div></div>';
+    }
+    h += '<div style="margin-top:20px;font-size:19px;color:rgba(255,255,255,.55)">' +
+      'Pick a title and the player takes over by itself.</div>';
+    nav.help.innerHTML = h;
+  }
+  function navToggleHelp() {
+    if (nav.help) { navCloseHelp(); return; }
+    var d = D.createElement('div');
+    d.setAttribute('data-mbp-nav', 'help');
+    d.style.cssText = 'position:fixed;right:48px;top:50%;transform:translateY(-50%);' +
+      'z-index:2147483647;width:720px;max-width:84vw;padding:34px 38px;border-radius:18px;' +
+      'background:rgba(16,18,22,.96);color:#fff;box-shadow:0 10px 40px rgba(0,0,0,.6);' +
+      'font-family:SamsungOne,Roboto,Arial,sans-serif;box-sizing:border-box;';
+    (D.body || D.documentElement).appendChild(d);
+    nav.help = d;
+    navRenderHelp();
+  }
+  function navCloseHelp() {
+    if (!nav.help) return;
+    try { nav.help.parentNode.removeChild(nav.help); } catch (e) {}
+    nav.help = null;
+  }
+
+  // ---------------------------------------------------------------- keys
+  function navKey(e) {
+    var a = KEYS[e.keyCode];
+    if (!a) return;
+    // A text field has focus, so the set's own keyboard is up and owns the
+    // keys. Back still has to work or there is no way out of the field.
+    if (navTyping()) {
+      if (a !== 'back') return;
+      e.preventDefault(); e.stopPropagation();
+      try { D.activeElement.blur(); } catch (err) {}
+      navDrawRing();
+      return;
+    }
+    if (nav.help) {
+      e.preventDefault(); e.stopPropagation();
+      if (a === 'left') navScaleNudge(-1);
+      else if (a === 'right') navScaleNudge(1);
+      else if (a === 'blue' || a === 'back' || a === 'ok') navCloseHelp();
+      return;
+    }
+    if (a === 'up' || a === 'down' || a === 'left' || a === 'right') {
+      e.preventDefault(); e.stopPropagation();
+      navMove(a);
+    } else if (a === 'ok') {
+      if (!nav.focus) return;              // nothing selected: let the site have it
+      e.preventDefault(); e.stopPropagation();
+      navActivate(nav.focus);
+    } else if (a === 'blue') {
+      e.preventDefault(); e.stopPropagation();
+      navToggleHelp();
+    } else if (a === 'back') {
+      // Do NOT swallow Back at the bottom of the history stack: on Tizen that
+      // is how someone leaves the app, and eating it traps them in the browser.
+      if (W.history.length > 1) {
+        e.preventDefault(); e.stopPropagation();
+        W.history.back();
+      }
+    }
+  }
+
+  function navStart() {
+    if (nav.on || state.tookOver) return;
+    nav.on = true;
+    navScaleApply();
+    registerKeys();
+    D.addEventListener('keydown', navKey, true);
+    nav.scrollFn = function () { navDrawRing(); };
+    W.addEventListener('scroll', nav.scrollFn, true);
+    nav.resizeFn = function () { navScaleApply(); nav.dirty = true; navDrawRing(); };
+    W.addEventListener('resize', nav.resizeFn);
+    try {
+      if (W.MutationObserver) {
+        nav.obs = new W.MutationObserver(function () { nav.dirty = true; });
+        nav.obs.observe(D.documentElement, { childList: true, subtree: true });
+      }
+    } catch (e) {}
+    // Keep a selection alive: pages here arrive in pieces, and the first
+    // render often has nothing pickable in it yet.
+    nav.pick = setInterval(function () {
+      if (!nav.on) { clearInterval(nav.pick); nav.pick = null; return; }
+      if (nav.focus && navAttached(nav.focus) && navShown(nav.focus)) { navDrawRing(); return; }
+      var c = navCandidates();
+      if (c.length) navSetFocus(navPickFirst(c));
+    }, 700);
+  }
+
+  function navStop() {
+    if (!nav.on) return;
+    nav.on = false;
+    D.removeEventListener('keydown', navKey, true);
+    if (nav.scrollFn) { W.removeEventListener('scroll', nav.scrollFn, true); nav.scrollFn = null; }
+    if (nav.resizeFn) { W.removeEventListener('resize', nav.resizeFn); nav.resizeFn = null; }
+    if (nav.obs) { try { nav.obs.disconnect(); } catch (e) {} nav.obs = null; }
+    if (nav.pick) { clearInterval(nav.pick); nav.pick = null; }
+    navCloseHelp();
+    if (nav.ring) { try { nav.ring.parentNode.removeChild(nav.ring); } catch (e2) {} nav.ring = null; }
+    nav.focus = null;
+    nav.cache = null;
+  }
+
   // ------------------------------------------------------------------ boot
   // The player data is already in the page once the site opens a title -- the
   // site did the navigating and the source lookup, and the <script> block that
@@ -1424,6 +1902,9 @@
     if (state.tookOver) return;
     state.tookOver = true;
     marks.takeoverAt = now();
+    // Navigation and the player must never both hold the keys. This is the
+    // whole handover: no mode flag the user can see, no second code path.
+    navStop();
     buildUi();
     D.addEventListener('keydown', onKey, true);
     registerKeys();
@@ -1434,8 +1915,9 @@
   }
 
   // The site also swaps the player in by AJAX without a page load, so the data
-  // can arrive late. Watch for it, cheaply, and give up after a while rather
-  // than observing forever.
+  // can arrive late. Watch for it cheaply, and -- now that browsing happens
+  // inside this same page load -- never stop watching. See the note on the
+  // ceiling below.
   function watchForPlayer() {
     var seen = playerDataInPage();
     if (seen) { takeOver(seen); return; }
@@ -1454,14 +1936,23 @@
       }
     } catch (e) {}
     // Belt and braces for a platform where the observer misbehaves.
-    var polls = 0;
+    //
+    // This used to give up after ~5 minutes, which was harmless while the mod
+    // assumed you ARRIVED on a player page: either the data was there within
+    // seconds or it was never coming. Now that navigation runs in this same
+    // page load, someone can browse for longer than that before picking a
+    // title -- and a ceiling would mean the player quietly loses the ability
+    // to take over once they do. That failure would present as the mod being
+    // broken, with nothing on screen to say why, so there is no ceiling.
+    //
+    // The cost of keeping it is one indexOf sweep of the page's inline
+    // scripts per second, which stops for good the instant takeOver() fires.
     var iv = setInterval(function () {
-      polls++;
-      if (check() || polls > 600) {           // ~5 minutes, then stop looking
+      if (check()) {
         clearInterval(iv);
         if (obs) { try { obs.disconnect(); } catch (e2) {} }
       }
-    }, 500);
+    }, 1000);
   }
 
   // TizenBrew registers the `keys` array from package.json before navigating,
@@ -1498,7 +1989,8 @@
   function boot() {
     var forced = devOpenRequest();
     if (forced) { CFG.open = forced; bootFetch(); return; }
-    watchForPlayer();
+    navStart();         // make the site's own pages reachable with the remote
+    watchForPlayer();   // and hand over the moment a player appears
   }
 
   function bootFetch() {
@@ -1545,6 +2037,19 @@
     playNext: playNext,
     urlExpiry: urlExpiry,
     startPairing: startPairing,
+    // navigation, so the fixture can drive the D-pad without a remote
+    nav: nav,
+    navCandidates: navCandidates,
+    navMove: navMove,
+    navActivate: navActivate,
+    navSetFocus: navSetFocus,
+    navPickFirst: navPickFirst,
+    navScaleGet: navScaleGet,
+    navScaleApply: navScaleApply,
+    navScaleNudge: navScaleNudge,
+    navToggleHelp: navToggleHelp,
+    navStart: navStart,
+    navStop: navStop,
     openSubPanel: openSubPanel,
     closeSubPanel: closeSubPanel,
     chooseSub: chooseSub,
