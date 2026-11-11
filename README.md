@@ -84,8 +84,10 @@ the Google button reveal code and QR sign-in.
 
 ## Status
 
-Early. The player has had one run on real hardware and the navigation none, so
-expect rough edges and please say what you hit.
+Early, and essentially untested on a TV. There has been exactly one attempt on
+real hardware, and it got no further than the signed-out page — which is why
+the navigation described above exists. **Nothing here has yet played a video on
+a Samsung set.** Expect rough edges, and please say what you hit.
 
 ## Licence
 
