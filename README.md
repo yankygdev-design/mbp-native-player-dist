@@ -16,8 +16,14 @@ find.
 There is no mode to switch.
 
 - **D-pad transport** — OK play/pause, Left/Right 10s, FF/RW 60s
-- **Quality** on Up/Down, with HEVC and AV1 gated on what the set can decode
-- **Subtitles** on Green: a language picker and a delay you can nudge in
+- **One settings panel**, on a held **OK** (or Up/Down): quality, subtitles,
+  subtitle delay, next episode and diagnostics in one place, with Up/Down to
+  choose a row and Left/Right to change it
+- **Conservative quality by default** — starts at 1080p or below with the
+  newer codecs off, and lets you climb from the panel. A codec string is the
+  decoder saying it can, not evidence that it does, so anything higher is
+  marked as unproven and can always be stepped back down
+- **Subtitles** with a language picker and a delay you can nudge in
   half-second steps
 - **Skip intro / outro** when the title has skip points
 - **Next episode** on Yellow, and automatically when one ends
@@ -33,7 +39,7 @@ There is no mode to switch.
 Add this as a module in TizenBrew:
 
 ```
-gh/yankygdev-design/mbp-native-player-dist@v0.3.0
+gh/yankygdev-design/mbp-native-player-dist@v0.4.0
 ```
 
 **Use a tag, not a branch.** jsDelivr caches a `@main` URL for hours, so after
@@ -68,10 +74,11 @@ While playing:
 | Key | Does |
 |---|---|
 | OK | Play / pause |
+| OK, held | Settings |
+| Up / Down | Settings |
 | Left / Right | Back / forward 10 seconds |
 | Rewind / Fast-forward | 60 seconds |
-| Up / Down | Change quality |
-| Green | Subtitles: language and delay |
+| Green | Settings, on the subtitles row |
 | Yellow | Next episode |
 | Blue | Diagnostics |
 | Back | Close a panel, or leave the player |

@@ -45,12 +45,12 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.3.0';
+  var BUILD_VERSION = '0.4.0';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
   // which is itself worth seeing on the diagnostics screen.
-  var BUILD_SHA = '18ef0b2';
+  var BUILD_SHA = '51e002f';
   var BUILD_SRC = (function () {
     try {
       var s = D.currentScript;
@@ -70,9 +70,20 @@
     // the id -- a client that only knows tfid cannot open a film at all.
     open: { kind: (/[?&]movie=1/.test(location.search) ? 'movie' : 'tv'),
             id: (/[?&]movie=1/.test(location.search) ? 990001 : 2480113) },
-    maxHeight: 2160,
+    // Deliberately conservative, and the reason is measured rather than
+    // cautious by temperament. A codec string from canPlayType is the decoder
+    // SAYING it can, which is not evidence that it does: project 1 climbed to
+    // a 4K HEVC rung on exactly that basis on a real set, and the player then
+    // buffered for good. This project's own TEST.md says the same thing --
+    // only the dropped-frame count at a high rung is evidence -- and then
+    // shipped a default that trusted the claim anyway.
+    //
+    // So the automatic choice stays at or below this, with the newer codecs
+    // off. Anything above it is a deliberate choice made in the settings
+    // panel, remembered, and steppable back down the same way.
+    maxHeight: 1080,
     maxMbps: 40,
-    allowHevc: true,
+    allowHevc: false,
     seekStep: 10,
     seekStepBig: 60,
     progressEvery: 60000,
@@ -298,7 +309,75 @@
   }
   function rungMbps(q) { return (parseFloat(q.bitstream) || 0) / 1000; }
 
+  // The rung the viewer last chose for themselves, by name rather than by
+  // height, so the codec travels with it and a 4K HEVC choice does not come
+  // back as a 4K H.264 one on the next title.
+  var SAFE_HEIGHT = 1080;
+  var RUNG_KEY = 'mbp_rung_name';
+  function rungPref() {
+    try { return W.localStorage.getItem(RUNG_KEY) || ''; } catch (e) { return ''; }
+  }
+  function rememberRung(name) {
+    try { W.localStorage.setItem(RUNG_KEY, String(name || '')); } catch (e) {}
+  }
+
+  // Every rung this set can decode at all, lowest first. The HEVC test here is
+  // a hard gate (the set cannot play it), not a quality ceiling -- the ceiling
+  // lives in pickRung, so the panel can still offer a climb above it.
+  function usableRungs() {
+    var d = state.data, out = [], i;
+    if (!d || !d.quality) return out;
+    for (i = 0; i < d.quality.length; i++) {
+      var q = d.quality[i];
+      if (String(q.name || '').toUpperCase() === 'ORG') continue;
+      if (!q.sources || !q.sources[0] || !q.sources[0].src) continue;
+      if (q.sources[0].h265 && !SUPPORTS_HEVC) continue;
+      out.push({ i: i, h: rungHeight(q), q: q });
+    }
+    out.sort(function (a, b) { return a.h - b.h; });
+    return out;
+  }
+
+  function rungLabel(e2) {
+    if (!e2) return '-';
+    var q = e2.q, bits = [];
+    bits.push(q.name || (e2.h ? e2.h + 'p' : '?'));
+    if (q.width && q.height) bits.push(q.width + 'x' + q.height);
+    if (q.codec) bits.push(q.codec);
+    return bits.join('  ');
+  }
+
+  // Left is always down and Right is always up: this CLAMPS rather than wraps,
+  // because the one thing a quality control on an untested panel must do is let
+  // a bad choice be undone. Wrapping from the top rung to the bottom reads as a
+  // glitch at the exact moment the viewer is trying to escape a stall.
+  function stepRung(dir) {
+    var list = usableRungs();
+    if (list.length < 2) { osd('Only one quality available'); return; }
+    var at = -1, i;
+    for (i = 0; i < list.length; i++) if (list[i].i === state.rung) at = i;
+    if (at < 0) at = 0;
+    var next = at + dir;
+    if (next < 0 || next >= list.length) return;
+    rememberRung(list[next].q.name || '');
+    playRung(list[next].i, true);
+    renderSettings();
+  }
+
   function pickRung(levels) {
+    // A rung the viewer chose themselves wins, when this title has it. They
+    // reached it from the panel and can step back down the same way, so this
+    // is their decision rather than a guess of ours.
+    var want = rungPref(), k;
+    if (want) {
+      for (k = 0; k < levels.length; k++) {
+        var lq = levels[k];
+        if (String(lq.name || '') !== want) continue;
+        if (!lq.sources || !lq.sources[0] || !lq.sources[0].src) continue;
+        if (lq.sources[0].h265 && !SUPPORTS_HEVC) continue;
+        return k;
+      }
+    }
     var best = -1, bestH = -1;
     for (var i = 0; i < levels.length; i++) {
       var q = levels[i], name = String(q.name || '').toUpperCase();
@@ -326,6 +405,7 @@
   var state = {
     // session-scoped: survives an episode change (see endEpisode)
     wired: false, progressTimer: null, subOn: true, tookOver: false,
+    okHeld: false,
     wakeTimer: null, lastTick: 0, wasPlaying: false,
     pairing: false, pairExpired: false, pairTimer: null,
     // episode-scoped: cleared by endEpisode()
@@ -1221,53 +1301,135 @@
   // A TV-shaped chooser: language list plus a delay row. Delay is free here --
   // the server bakes the offset into the VTT, so changing it is just a new
   // track URL, no client-side timing at all.
-  function openSubPanel() {
-    var d = state.data;
-    if (!d || !d.subs.length) { osd('No subtitles for this title'); return; }
-    state.panel = 'subs';
-    state.panelRow = 0;                       // 0..n-1 tracks, n = "Off", n+1 = delay
-    renderSubPanel();
+  // --------------------------------------------------------- settings panel
+  // One panel, one gesture to reach it, and every playback setting inside it.
+  //
+  // The colour keys stay as shortcuts, but nothing lives ONLY on a colour key
+  // any more. That was the actual complaint -- "very wonky to go to the
+  // settings of the player, like the quality and stuff like that" -- and it
+  // was about reach, not about which key did what. Making two key maps agree
+  // would only have made them consistently unmemorable.
+  //
+  // One rule for the whole panel: Up/Down move, Left/Right change the value on
+  // the row, OK acts. No nesting, so there is never a question of which level
+  // a press applies to.
+  //
+  // Rows are descriptors rather than index arithmetic on purpose. The old
+  // subtitle panel computed `rows = subs.length + 2` and indexed into it, and
+  // that shape is what let a stale panel point at the previous episode's
+  // tracks. A row now carries its own behaviour.
+  function settingsRows() {
+    var d = state.data, rows = [], i;
+    if (!d) return rows;
+
+    var list = usableRungs(), at = -1;
+    for (i = 0; i < list.length; i++) if (list[i].i === state.rung) at = i;
+    var cur = at >= 0 ? list[at] : null;
+    rows.push({
+      label: 'Quality',
+      value: rungLabel(cur),
+      // Flagged, not blocked. Above this nothing has been shown to decode on a
+      // real set; saying so is more use to the viewer than refusing to offer it.
+      note: (cur && cur.h > SAFE_HEIGHT) ? 'not proven on this set' : '',
+      lo: at <= 0,
+      hi: at >= 0 && at >= list.length - 1,
+      left: function () { stepRung(-1); },
+      right: function () { stepRung(1); }
+    });
+
+    if (d.subs && d.subs.length) {
+      rows.push({
+        label: 'Subtitles',
+        value: (state.subOn && d.subs[state.subIndex]) ? d.subs[state.subIndex].name : 'Off',
+        left: function () { cycleSub(-1); },
+        right: function () { cycleSub(1); }
+      });
+      if (state.subOn && d.subs[state.subIndex]) {
+        var dl = d.subs[state.subIndex].delay || 0;
+        rows.push({
+          label: 'Subtitle delay',
+          value: (dl > 0 ? '+' : '') + dl.toFixed(1) + 's',
+          left: function () { nudgeDelay(-0.5); },
+          right: function () { nudgeDelay(0.5); }
+        });
+      }
+    }
+
+    if (CFG.open.kind === 'tv') {
+      rows.push({ label: 'Next episode', value: 'OK',
+                  ok: function () { closeSettings(); playNext(); } });
+    }
+    rows.push({ label: 'Diagnostics', value: 'OK',
+                ok: function () { closeSettings(); toggleDiag(); } });
+    return rows;
   }
 
-  function closeSubPanel() {
+  function cycleSub(dir) {
+    var subs = state.data.subs, n = subs.length + 1;      // tracks, then Off
+    var at = state.subOn ? state.subIndex : subs.length;
+    chooseSub((at + dir + n) % n);
+  }
+
+  function openSettings(row) {
+    if (!state.data) { osd('Nothing to configure yet'); return; }
+    state.panel = 'settings';
+    state.panelRow = row || 0;
+    renderSettings();
+  }
+
+  function closeSettings() {
     state.panel = null;
     if (ui.panel) { try { ui.panel.parentNode.removeChild(ui.panel); } catch (e) {} ui.panel = null; }
     osd();
   }
 
-  function renderSubPanel() {
-    var d = state.data, subs = d.subs;
+  function renderSettings() {
+    if (state.panel !== 'settings') return;
+    var rows = settingsRows();
+    if (!rows.length) { closeSettings(); return; }
+    if (state.panelRow >= rows.length) state.panelRow = rows.length - 1;
+    if (state.panelRow < 0) state.panelRow = 0;
     if (ui.panel) { try { ui.panel.parentNode.removeChild(ui.panel); } catch (e) {} }
-    var p = el('div', 'position:fixed;right:0;top:0;bottom:0;width:min(46vw,560px);' +
-      'background:rgba(8,10,14,.94);padding:36px 32px;overflow:auto;z-index:50');
-    p.appendChild(el('div', 'font-size:22px;font-weight:700;color:#7fd0ff;margin-bottom:4px', 'Subtitles'));
-    p.appendChild(el('div', 'font-size:13px;color:#8fa3b8;margin-bottom:20px',
-      'Up/Down choose  ·  Left/Right adjust delay  ·  OK or Back close'));
 
-    var rows = subs.length + 2;
-    for (var i = 0; i < rows; i++) {
-      var sel = (i === state.panelRow);
-      var row = el('div', 'display:flex;justify-content:space-between;gap:14px;padding:11px 14px;' +
-        'border-radius:8px;margin-bottom:4px;' +
+    var p = el('div', 'position:fixed;right:0;top:0;bottom:0;width:min(52vw,680px);' +
+      'background:rgba(8,10,14,.94);padding:36px 32px;overflow:auto;z-index:50');
+    p.appendChild(el('div', 'font-size:22px;font-weight:700;color:#7fd0ff;margin-bottom:4px', 'Settings'));
+    p.appendChild(el('div', 'font-size:13px;color:#8fa3b8;margin-bottom:20px',
+      'Up/Down choose  \u00b7  Left/Right change  \u00b7  Back closes'));
+
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i], sel = (i === state.panelRow);
+      var row = el('div', 'display:flex;justify-content:space-between;align-items:center;' +
+        'gap:14px;padding:12px 14px;border-radius:8px;margin-bottom:4px;' +
         (sel ? 'background:#1d4f6b;color:#fff;' : 'color:#cfe0ef;'));
-      if (i < subs.length) {
-        var active = state.subOn && state.subIndex === i;
-        row.appendChild(el('span', null, (active ? '✓  ' : '   ') + subs[i].name));
-        row.appendChild(el('span', 'color:#8fa3b8;font-size:13px',
-          (subs[i].lang || '').toUpperCase() + (subs[i].delay ? '  ' + subs[i].delay + 's' : '')));
-      } else if (i === subs.length) {
-        row.appendChild(el('span', null, (!state.subOn ? '✓  ' : '   ') + 'Off'));
-      } else {
-        var cur = subs[state.subIndex] || { delay: 0 };
-        row.appendChild(el('span', null, 'Delay'));
-        row.appendChild(el('span', 'color:#7fd0ff;font-weight:600',
-          '◀  ' + (cur.delay > 0 ? '+' : '') + cur.delay.toFixed(1) + 's  ▶'));
-      }
+      row.appendChild(el('span', 'flex:0 0 40%', r.label));
+      var right = el('div', 'text-align:right');
+      var stepper = !!(r.left || r.right);
+      var txt = stepper
+        ? (r.lo ? '     ' : '\u25c0  ') + r.value + (r.hi ? '     ' : '  \u25b6')
+        : r.value;
+      right.appendChild(el('div', 'color:' + (sel ? '#7fd0ff' : '#9fb4c8') + ';font-weight:600', txt));
+      if (r.note) right.appendChild(el('div', 'font-size:12px;color:#ffd479', r.note));
+      row.appendChild(right);
       p.appendChild(row);
     }
     D.body.appendChild(p);
     ui.panel = p;
   }
+
+  // Green still means subtitles, but now as a shortcut INTO the panel rather
+  // than a separate screen: one place where settings live, with the colour key
+  // as a convenience instead of the only route.
+  function openSubPanel() {
+    var d = state.data;
+    if (!d || !d.subs || !d.subs.length) { osd('No subtitles for this title'); return; }
+    var rows = settingsRows(), i;
+    for (i = 0; i < rows.length; i++) {
+      if (rows[i].label === 'Subtitles') { openSettings(i); return; }
+    }
+    openSettings(0);
+  }
+  function closeSubPanel() { closeSettings(); }
 
   function chooseSub(i) {
     var subs = state.data.subs;
@@ -1282,7 +1444,7 @@
       var tt = ui.video.textTracks;
       for (var k = 0; k < tt.length; k++) { try { tt[k].mode = 'disabled'; } catch (e) {} }
     }
-    renderSubPanel();
+    renderSettings();
   }
 
   function nudgeDelay(by) {
@@ -1292,7 +1454,7 @@
     // Re-point the track: the server returns VTT with the new offset applied.
     if (state.subOn) applySubtitle(sub);
     rememberDelay(sub);
-    renderSubPanel();
+    renderSettings();
   }
 
   // Returns true if the panel consumed the key. Navigation and OK belong to
@@ -1300,21 +1462,24 @@
   // expected to keep working while a menu is open, and swallowing them makes
   // the remote feel broken.
   function panelKey(a) {
-    var rows = state.data.subs.length + 2;
-    if (a === 'up') { state.panelRow = (state.panelRow - 1 + rows) % rows; renderSubPanel(); return true; }
-    if (a === 'down') { state.panelRow = (state.panelRow + 1) % rows; renderSubPanel(); return true; }
-    if (a === 'left') { if (state.panelRow === rows - 1) nudgeDelay(-0.5); return true; }
-    if (a === 'right') { if (state.panelRow === rows - 1) nudgeDelay(0.5); return true; }
+    var rows = settingsRows();
+    if (!rows.length) { closeSettings(); return false; }
+    if (state.panelRow >= rows.length) state.panelRow = rows.length - 1;
+    var r = rows[state.panelRow];
+    if (a === 'up') { state.panelRow = (state.panelRow - 1 + rows.length) % rows.length; renderSettings(); return true; }
+    if (a === 'down') { state.panelRow = (state.panelRow + 1) % rows.length; renderSettings(); return true; }
+    if (a === 'left') { if (r.left) r.left(); return true; }
+    if (a === 'right') { if (r.right) r.right(); return true; }
     if (a === 'ok') {
-      if (state.panelRow < rows - 1) chooseSub(state.panelRow);
-      else closeSubPanel();
+      if (r.ok) r.ok();
+      else if (r.right) r.right();    // a value row: OK nudges it rather than doing nothing
       return true;
     }
-    if (a === 'back' || a === 'green') { closeSubPanel(); return true; }
+    if (a === 'back' || a === 'green') { closeSettings(); return true; }
     // Anything else (play, pause, ff, rw, next, prev, red) falls through to
     // playback. A transport key also dismisses the menu, since the viewer has
     // clearly moved on from it.
-    if (a === 'next' || a === 'prev') closeSubPanel();
+    if (a === 'next' || a === 'prev') closeSettings();
     return false;
   }
 
@@ -1340,21 +1505,6 @@
     tick(); osd();
   }
 
-  function cycleRung(dir) {
-    var d = state.data;
-    if (!d) return;
-    var usable = [];
-    for (var i = 0; i < d.quality.length; i++) {
-      var q = d.quality[i];
-      if (!q.sources || !q.sources[0] || !q.sources[0].src) continue;
-      if (q.sources[0].h265 && !SUPPORTS_HEVC) continue;
-      usable.push(i);
-    }
-    if (usable.length < 2) { osd('Only one quality available'); return; }
-    var at = usable.indexOf(state.rung);
-    var next = usable[(at + dir + usable.length) % usable.length];
-    playRung(next, true);
-  }
 
   function toggleSubs() {
     state.subOn = !state.subOn;
@@ -1366,30 +1516,61 @@
         (state.sub && state.subOn ? '  ' + state.sub.name : ''));
   }
 
+  // OK does two jobs, so they have to be told apart, and a TV remote gives no
+  // held-key event to do it with: keydown fires once, then AUTO-REPEATS at the
+  // set's own rate after the set's own delay, and keyup arrives on release.
+  //
+  // So settings open on the first REPEAT rather than on a timer of mine. The
+  // threshold is then the set's repeat delay -- the same delay the viewer
+  // already feels everywhere else on their own TV -- instead of a number I
+  // guessed at and could not test on hardware. And play/pause moves to
+  // RELEASE, so a short press never waits to find out whether a long press was
+  // coming.
+  function okShortPress() {
+    var v = ui.video;
+    if (state.skipAction) { var act = state.skipAction; hideSkip(); act(); return; }
+    if (state.pairExpired) { state.pairExpired = false; startPairing(function () { boot(); }); return; }
+    if (v.paused) {
+      if (state.needsRefresh) { retryOwedRefresh('Refreshing link...', true); osd(); return; }
+      var p = v.play(); if (p && p['catch']) p['catch'](function () {});
+    } else v.pause();
+    osd();
+  }
+
+  function onKeyUp(e) {
+    if (KEYS[e.keyCode] !== 'ok') return;
+    e.preventDefault(); e.stopPropagation();
+    if (state.okHeld) { state.okHeld = false; return; }   // the hold already acted
+    okShortPress();
+  }
+
   function onKey(e) {
     var a = KEYS[e.keyCode];
     if (!a) return;
     e.preventDefault(); e.stopPropagation();
+    // A lost keyup would otherwise leave OK dead for good, so any other key
+    // clears the held flag.
+    if (a !== 'ok') state.okHeld = false;
     if (ui.diag && (a === 'blue' || a === 'back')) { toggleDiag(); return; }
-    if (state.panel === 'subs' && panelKey(a)) return;
-    var v = ui.video;
-    if (a === 'ok' && state.skipAction) { var act = state.skipAction; hideSkip(); act(); return; }
-    if (a === 'ok' && state.pairExpired) { state.pairExpired = false; startPairing(function(){ boot(); }); return; }
+    // Still holding the press that opened the panel. Without this the hold
+    // would open settings and then immediately act on its first row.
+    if (a === 'ok' && state.okHeld) return;
+    if (state.panel && panelKey(a)) { if (a === 'ok') state.okHeld = true; return; }
     if (a === 'ok') {
-      if (v.paused) {
-        if (state.needsRefresh) { retryOwedRefresh('Refreshing link...', true); osd(); return; }
-        var p = v.play(); if (p && p['catch']) p['catch'](function () {});
-      } else v.pause();
-      osd();
+      if (e.repeat) { state.okHeld = true; openSettings(); }
+      return;                           // the short press is handled on release
     }
-    else if (a === 'play') { var p2 = v.play(); if (p2 && p2['catch']) p2['catch'](function () {}); osd(); }
+    var v = ui.video;
+    if (a === 'play') { var p2 = v.play(); if (p2 && p2['catch']) p2['catch'](function () {}); osd(); }
     else if (a === 'pause') { v.pause(); osd(); }
     else if (a === 'left') seek(-CFG.seekStep);
     else if (a === 'right') seek(CFG.seekStep);
     else if (a === 'rw') seek(-CFG.seekStepBig);
     else if (a === 'ff') seek(CFG.seekStepBig);
-    else if (a === 'up') cycleRung(1);
-    else if (a === 'down') cycleRung(-1);
+    // Up and Down open settings as well. Holding OK is what was asked for, but
+    // it is an untested gesture on this hardware and it depends on the set's
+    // repeat behaviour, so it is deliberately not the only way in.
+    else if (a === 'up' || a === 'down') openSettings();
     else if (a === 'red') toggleSubs();
     else if (a === 'blue') toggleDiag();
     else if (a === 'green') openSubPanel();
@@ -1426,7 +1607,10 @@
    * and takeOver() runs. There is no mode for anyone to understand or switch,
    * and no second code path -- the handover is the one already there.
    */
-  var NAV_SEMANTIC = 'a[href],button,input,select,textarea,summary,[tabindex],' +
+  // 'a:not([href])' is there because project 1's second hardware run found
+  // episode rows to be anchors with no href at all -- 'a[href]' walks past
+  // them, and episode rows are the one thing a series page exists for.
+  var NAV_SEMANTIC = 'a[href],a:not([href]),button,input,select,textarea,summary,[tabindex],' +
     '[onclick],[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="option"]';
 
   // Clickable on this site through a jQuery handler and nothing else.
@@ -1907,6 +2091,7 @@
     navStop();
     buildUi();
     D.addEventListener('keydown', onKey, true);
+    D.addEventListener('keyup', onKeyUp, true);
     registerKeys();
     try { start(scriptText); } catch (e) {
       showMsg(el('div', 'font-size:22px;font-weight:600', 'Could not read the player data'),
@@ -1996,6 +2181,7 @@
   function bootFetch() {
     buildUi();
     D.addEventListener('keydown', onKey, true);
+    D.addEventListener('keyup', onKeyUp, true);
     registerKeys();
     state.tookOver = true;
     marks.takeoverAt = now();
@@ -2051,6 +2237,16 @@
     navStart: navStart,
     navStop: navStop,
     openSubPanel: openSubPanel,
+    openSettings: openSettings,
+    closeSettings: closeSettings,
+    settingsRows: settingsRows,
+    panelKey: panelKey,
+    stepRung: stepRung,
+    usableRungs: usableRungs,
+    rungPref: rungPref,
+    rememberRung: rememberRung,
+    pickRung: pickRung,
+    SAFE_HEIGHT: SAFE_HEIGHT,
     closeSubPanel: closeSubPanel,
     chooseSub: chooseSub,
     nudgeDelay: nudgeDelay,
