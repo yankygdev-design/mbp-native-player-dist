@@ -50,7 +50,7 @@
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
   // which is itself worth seeing on the diagnostics screen.
-  var BUILD_SHA = '2d4a442';
+  var BUILD_SHA = 'e7af54c';
   var BUILD_SRC = (function () {
     try {
       var s = D.currentScript;
@@ -2327,6 +2327,7 @@
     secondsUntilExpiry: secondsUntilExpiry,
     fetchTarget: fetchTarget,
     CFG: CFG,
+    now: now,
     state: state,
     parsePlayerPage: parsePlayerPage,
     playerDataInPage: playerDataInPage,
