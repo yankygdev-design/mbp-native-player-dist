@@ -76,7 +76,7 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.4.7';
+  var BUILD_VERSION = '0.4.8';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
@@ -2256,9 +2256,16 @@
    * account identifiers, and this screen gets photographed and sent to me.
    * Counting a name is enough to say which branch of the parser should run;
    * printing its value would put a session on a photograph. */
+  /* Measured on the live player page, 12 November 2026: of this list only
+   * `playlist` appeared, once, in roughly 141 KB of inline script. There is no
+   * qualityLevels and no sources on that page at all, so the takeover rule
+   * has been waiting for markers the site does not emit. Widened to find what
+   * it does emit. */
   var DETECT_MARKERS = ['qualityLevels', 'sources', 'playerData', 'player_data',
                         'videoUrl', 'video_url', 'mp4_id', 'srt_path', 'playlist',
-                        'hls', 'm3u8'];
+                        'hls', 'm3u8', 'play_url', 'playUrl', 'file_url', 'fileUrl',
+                        'video_list', 'videoList', 'quality', 'resolution', 'stream',
+                        'tfid', 'mfid', 'mp4', 'subtitle', 'episode'];
 
   function navDetectReport() {
     var tags = D.getElementsByTagName('script');
@@ -2276,9 +2283,44 @@
       if (txt.indexOf('qualityLevels') >= 0 && txt.indexOf('sources') >= 0) { both++; }
     }
 
+    /* The video element's source SCHEME, never the url. This single fact
+     * decides the whole approach: a blob: source means the site is feeding
+     * MediaSource from script and there is no url to adopt, so the module has
+     * to fetch the player data itself. An https: source means the url is
+     * right there on the element. */
+    var vids = D.getElementsByTagName('video'), scheme = 'none', vi, vs;
+    for (vi = 0; vi < vids.length; vi++) {
+      vs = vids[vi].currentSrc || vids[vi].src || '';
+      if (vs) { scheme = (vs.split(':')[0] || '?') + ':'; break; }
+    }
+
+    /* Variable NAMES declared in the inline scripts that look like they could
+     * hold player data. Names only - the values are signed urls. 141KB of
+     * script is far too much to read from a photograph, so this is the part
+     * that narrows it to something readable. */
+    var names = {}, list = [], m;
+    var decl = /\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=/g;
+    var interesting = /play|video|quality|url|src|sub|m3u8|hls|episode|season|stream|file|media/i;
+    for (i = 0; i < tags.length; i++) {
+      if (tags[i].src) { continue; }
+      txt = tags[i].textContent || '';
+      decl.lastIndex = 0;
+      while ((m = decl.exec(txt)) !== null) {
+        if (interesting.test(m[1]) && !names[m[1]]) {
+          names[m[1]] = 1;
+          list.push(m[1]);
+          if (list.length >= 24) { break; }
+        }
+      }
+      if (list.length >= 24) { break; }
+    }
+
+    var where = '(unavailable)';
+    try { where = String(W.location.pathname + W.location.search).slice(0, 80); } catch (e) {}
+
     return { inline: inline, bytes: bytes, both: both, hits: hits,
              external: tags.length - inline,
-             video: D.getElementsByTagName('video').length,
+             video: vids.length, scheme: scheme, names: list, url: where,
              tookOver: !!state.tookOver };
   }
 
@@ -2303,7 +2345,10 @@
       'external scripts  ' + d.external + '\n' +
       'video elements  ' + d.video + '\n' +
       'both markers in one script  ' + d.both + '   (takeover needs 1 or more)\n' +
-      'markers seen    ' + line +
+      'markers seen    ' + line + '\n' +
+      'page            ' + d.url + '\n' +
+      'video source    ' + d.scheme + '\n' +
+      'variable names  ' + (d.names.length ? d.names.join('  ') : '(none that look like player data)') +
       '</div>' +
       '<div style="font-size:15px;color:rgba(255,255,255,.5);margin-top:8px">' +
       'Names only - never values. A player page holds signed URLs.</div></div>';
