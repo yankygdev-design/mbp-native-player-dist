@@ -76,7 +76,7 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.4.8';
+  var BUILD_VERSION = '0.5.0';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
@@ -477,6 +477,8 @@
     // session-scoped: survives an episode change (see endEpisode)
     wired: false, progressTimer: null, subOn: true, tookOver: false,
     guard: null, hidden: 0,
+    // what the inline-play attempt did, reported on the Blue card
+    playAttempt: 'not attempted',
     okHeld: false,
     wakeTimer: null, lastTick: 0, wasPlaying: false,
     pairing: false, pairExpired: false, pairTimer: null,
@@ -2348,7 +2350,8 @@
       'markers seen    ' + line + '\n' +
       'page            ' + d.url + '\n' +
       'video source    ' + d.scheme + '\n' +
-      'variable names  ' + (d.names.length ? d.names.join('  ') : '(none that look like player data)') +
+      'variable names  ' + (d.names.length ? d.names.join('  ') : '(none that look like player data)') + '\n' +
+      'play attempt    ' + state.playAttempt +
       '</div>' +
       '<div style="font-size:15px;color:rgba(255,255,255,.5);margin-top:8px">' +
       'Names only - never values. A player page holds signed URLs.</div></div>';
@@ -2738,11 +2741,119 @@
     return m ? { kind: m[1], id: m[2] } : null;
   }
 
+  /* ================================================ the site plays INLINE
+   *
+   * Measured on the live site, 12 November 2026. Picking a title lands on
+   *
+   *     /tvshow/101?from=home&play=1
+   *
+   * THERE IS NO SEPARATE PLAYER PAGE. The site plays on the detail page, with
+   * `play=1` appended. watchForPlayer() has been waiting for a page that does
+   * not exist, and the markers it waits for - qualityLevels and sources - are
+   * nowhere in that page's 141 KB of inline script either. What is there is
+   * url2, oss_url2 and oss_download_url, and the video element's source is a
+   * blob:, so the site feeds MediaSource from script and there is no url on
+   * the element to adopt.
+   *
+   * So stop scraping the page and ask the API, which is what the module
+   * already does for a forced open (devOpenRequest -> bootFetch) and what it
+   * was developed against. Same-origin here, so the session rides along.
+   *
+   * THE ATTEMPT IS NON-DESTRUCTIVE, deliberately. The site's own player works
+   * - badly, but it works. So fetch FIRST and take over only on success: a
+   * failure must leave the site's player alone rather than replacing a
+   * working picture with our error screen. Whatever happens is recorded in
+   * state.playAttempt and shown on the Blue card.
+   */
+  function playRequestFromUrl() {
+    var path = '', search = '';
+    try { path = W.location.pathname || ''; search = W.location.search || ''; } catch (e) { return null; }
+    if (!/[?&]play=1(?:&|$)/.test(search)) { return null; }
+    var m = /\/(tvshow|movie)\/(\d+)/.exec(path);
+    if (!m) { return null; }
+    return { kind: (m[1] === 'movie') ? 'movie' : 'tv', id: m[2] };
+  }
+
+  /* The inline scripts, joined, so the existing scalar reader can be pointed
+   * at them. The page carries start_season and start_episode, which is how it
+   * knows which episode it is about to play. */
+  function inlineScriptText() {
+    var tags = D.getElementsByTagName('script'), out = [], i;
+    for (i = 0; i < tags.length; i++) {
+      if (!tags[i].src) { out.push(tags[i].textContent || ''); }
+    }
+    return out.join('\n');
+  }
+
+  function pageNumber(name, fallback) {
+    var v;
+    try { v = extractScalar(inlineScriptText(), name); } catch (e) { return fallback; }
+    v = parseInt(v, 10);
+    return (v > 0) ? v : fallback;
+  }
+
+  /* A film's id in the path may be what the player endpoint wants. A series'
+   * is NOT: /tvshow/101 is the series, and the endpoint wants the EPISODE's
+   * tfid, so the episode list has to be asked first. */
+  function resolvePlayable(req) {
+    if (req.kind === 'movie') {
+      return Promise.resolve({ kind: 'movie', id: req.id, note: 'movie id straight from the path' });
+    }
+    var season = pageNumber('start_season', 1);
+    var wantEp = pageNumber('start_episode', 1);
+    return episodesFor(req.id, season).then(function (list) {
+      if (!list || !list.length) {
+        throw new Error('no episodes listed for season ' + season);
+      }
+      var pick = null, i;
+      for (i = 0; i < list.length; i++) {
+        if (Number(list[i].episode) === Number(wantEp)) { pick = list[i]; break; }
+      }
+      if (!pick) { pick = list[0]; }
+      var tfid = pick.tfid || pick.fid || pick.id;
+      if (!tfid) { throw new Error('episode row carries no tfid'); }
+      return { kind: 'tv', id: String(tfid),
+               note: 's' + season + 'e' + wantEp + ' of ' + list.length };
+    });
+  }
+
+  function tryInlinePlay(req) {
+    state.playAttempt = 'resolving ' + req.kind + ' ' + req.id;
+    L.info('play', state.playAttempt);
+
+    resolvePlayable(req).then(function (p) {
+      state.playAttempt = 'fetching (' + (p.note || '') + ')';
+      return fetchPlayer(p, 0).then(function (txt) {
+        if (state.tookOver) { return; }      // something else got there first
+        state.playAttempt = 'took over';
+        L.info('play', 'player data fetched; taking over');
+        navStop();
+        buildUi();
+        D.addEventListener('keydown', onKey, true);
+        D.addEventListener('keyup', onKeyUp, true);
+        registerKeys();
+        state.tookOver = true;
+        marks.takeoverAt = now();
+        start(txt);
+      });
+    })['catch'](function (e) {
+      // Leave the site's player running. Record why, and say so on the card.
+      state.playAttempt = 'FAILED: ' + ((e && e.message) ? e.message : 'unknown');
+      L.warn('play', state.playAttempt);
+    });
+  }
+
   function boot() {
     var forced = devOpenRequest();
     if (forced) { CFG.open = forced; bootFetch(); return; }
     navStart();         // make the site's own pages reachable with the remote
     watchForPlayer();   // and hand over the moment a player appears
+
+    // The site plays inline on the detail page, so this is the real trigger.
+    // Runs AFTER navStart so the page stays usable while the fetch is in
+    // flight, and takes over only if the fetch succeeds.
+    var inlinePlay = playRequestFromUrl();
+    if (inlinePlay) { tryInlinePlay(inlinePlay); }
   }
 
   function bootFetch() {

@@ -1,7 +1,7 @@
 {
   "name": "mbp-native-player",
   "appName": "MBP Native Player",
-  "version": "0.4.8",
+  "version": "0.5.0",
   "description": "MovieBoxPro with the TV remote: D-pad navigation over the site's own pages, then a TV-shaped player with transport, a subtitle picker with delay, skip intro/outro and resume across sleep.",
   "packageType": "mods",
   "websiteURL": "https://www.movieboxpro.app/",
