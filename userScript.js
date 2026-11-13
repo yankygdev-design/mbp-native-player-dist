@@ -76,7 +76,7 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.4.4';
+  var BUILD_VERSION = '0.4.5';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
@@ -1815,7 +1815,11 @@
     harvestMs: 0, harvestN: 0,
     // the stranded-page watch: when we first noticed nothing was selectable,
     // and the overlay that says so. Cleared the moment the page becomes usable.
-    stuckSince: 0, stuckBox: null
+    stuckSince: 0, stuckBox: null,
+    // the viewport tag that magnifies the px catalogue, and the width the
+    // page had BEFORE we touched it -- every sum has to use that, not the
+    // live innerWidth, which our own tag changes
+    vpEl: null, baseW: 0
   };
 
   function navRect(n) {
@@ -2132,7 +2136,7 @@
   //     reports unzoomed coordinates while elementFromPoint wants visual
   //     pixels, so every synthetic click's hit test returns null and nothing
   //     is clickable at all.
-  var NAV_SCALE_KEY = 'mbp_scale', NAV_SCALE_MIN = 0.5, NAV_SCALE_MAX = 1.4;
+  var NAV_SCALE_KEY = 'mbp_scale', NAV_SCALE_MIN = 0.5, NAV_SCALE_MAX = 2.5;
   function navScaleClamp(v) {
     return Math.max(NAV_SCALE_MIN, Math.min(NAV_SCALE_MAX, Math.round(v * 20) / 20));
   }
@@ -2141,8 +2145,70 @@
     try { v = parseFloat(W.localStorage.getItem(NAV_SCALE_KEY)); } catch (e) {}
     return navScaleClamp(v > 0 ? v : 1);    // 1 == the design filling the screen width
   }
+  /* THE CATALOGUE IS NOT THE PHONE DESIGN, and that is why this page stayed
+   * tiny while the sign-in page grew.
+   *
+   * The font-size rule below is a rem fix: it undoes the site's 750px cap so
+   * the phone-design pages fill the screen. It works, and it is kept. But the
+   * catalogue is a DESKTOP layout sized in px -- measured on the site: 1028
+   * px declarations against 331 rem, no vw at all, and two @media blocks
+   * holding 66 bytes between them. Nothing about a root font-size can move a
+   * px box, which is exactly what 'everything was still tiny' is.
+   *
+   * A viewport tag can. Ask the engine to lay the page out in fewer CSS
+   * pixels and it scales the result up to the panel: px boxes, rem boxes and
+   * images all grow together. Proven on project 1 (MBP-STV v1.8.x), where the
+   * same root-font-size approach failed on the same page for the same reason.
+   *
+   * Two traps paid for there, both avoided here:
+   *   - every sum must use the width the page had BEFORE our tag, because our
+   *     own tag changes innerWidth. Using the live value applies the factor
+   *     twice and the page scales by the square of what the menu says.
+   *   - the font-size sum must NOT also carry the factor. The viewport scales
+   *     rem boxes too, so multiplying here would magnify them twice while the
+   *     px boxes around them grew once, and the layout would come apart.
+   */
+  function navVpApply() {
+    if (!nav.baseW) { nav.baseW = W.innerWidth; }
+    if (!(nav.baseW > 240)) { return; }
+    var f = navScaleGet();
+
+    if (f === 1) {
+      // 1 means the page as the site lays it out. One press of Left from a
+      // misbehaving set is the page exactly as it shipped.
+      if (nav.vpEl && nav.vpEl.parentNode) {
+        nav.vpEl.parentNode.removeChild(nav.vpEl);
+        nav.dirty = true;
+      }
+      nav.vpEl = null;
+      return;
+    }
+
+    var w = Math.round(nav.baseW / f);
+    if (!(w > 240)) { return; }
+
+    if (!nav.vpEl || !navAttached(nav.vpEl)) {
+      nav.vpEl = D.createElement('meta');
+      nav.vpEl.setAttribute('name', 'viewport');
+      nav.vpEl.setAttribute('data-mbp-nav', 'viewport');
+      // Appended last: where several viewport tags exist the last one wins,
+      // so the site's own cannot override ours.
+      (D.head || D.documentElement).appendChild(nav.vpEl);
+      nav.dirty = true;
+    }
+    var want = 'width=' + w + ',initial-scale=' + (nav.baseW / w).toFixed(3);
+    if (nav.vpEl.getAttribute('content') !== want) {
+      nav.vpEl.setAttribute('content', want);
+      nav.dirty = true;
+    }
+  }
+
   function navScaleApply() {
-    var px = (W.innerWidth / 7.5) * navScaleGet();
+    navVpApply();
+
+    // Deliberately nav.baseW and NOT the factor: see navVpApply's note on
+    // applying it twice.
+    var px = (nav.baseW || W.innerWidth) / 7.5;
     if (!(px > 0)) return;                  // a zero-width viewport: leave the site alone
     if (!nav.scaleEl || !navAttached(nav.scaleEl)) {
       nav.scaleEl = D.createElement('style');
@@ -2348,6 +2414,9 @@
     D.addEventListener('keydown', navKey, true);
     nav.scrollFn = function () { navDrawRing(); };
     W.addEventListener('scroll', nav.scrollFn, true);
+    // NOTE: this must not re-capture nav.baseW. A resize fires when our own
+    // viewport tag lands, so re-reading innerWidth here would feed the
+    // magnified width back into the sum and shrink the page a step at a time.
     nav.resizeFn = function () { navScaleApply(); nav.dirty = true; navDrawRing(); };
     W.addEventListener('resize', nav.resizeFn);
     try {
