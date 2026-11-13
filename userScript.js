@@ -76,7 +76,7 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.4.6';
+  var BUILD_VERSION = '0.4.7';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
@@ -1819,7 +1819,10 @@
     // the viewport tag that magnifies the px catalogue, and the width the
     // page had BEFORE we touched it -- every sum has to use that, not the
     // live innerWidth, which our own tag changes
-    vpEl: null, baseW: 0
+    vpEl: null, baseW: 0,
+    // the always-on stamp: the only way to tell 'the module is not running
+    // on this page' from 'the module is running and a key is being eaten'
+    badge: null
   };
 
   function navRect(n) {
@@ -2222,6 +2225,7 @@
     var v = navScaleClamp(navScaleGet() + dir * 0.05);
     try { W.localStorage.setItem(NAV_SCALE_KEY, String(v)); } catch (e) {}
     navScaleApply();
+    navBadge();
     nav.dirty = true;
     navRenderHelp();
     setTimeout(function () { nav.dirty = true; navDrawRing(); }, 60);
@@ -2481,10 +2485,57 @@
     if (ms >= STUCK_AFTER_MS) { navStuckShow(Math.round(ms / 1000)); }
   }
 
+  /* --------------------------------------------------------------- the stamp
+   *
+   * Reported 12 November 2026: on the site's player page, Blue did nothing at
+   * all - no card, no reaction. There are two completely different reasons for
+   * that and no way to tell them apart from the sofa:
+   *
+   *   1. the module is not running on that page. TizenBrew injects on page
+   *      load; if a navigation does not re-inject, every later page has no
+   *      module at all - which would explain the missing card AND the player
+   *      never taking over, with one cause.
+   *   2. the module is running and something is eating the key.
+   *
+   * Those need opposite fixes, so guessing is worthless. A stamp that is
+   * present whenever this code is present answers it in one glance: if it is
+   * on the catalogue and absent on the player page, it is reason 1.
+   *
+   * It also shows the size percentage, because the size control turned out to
+   * be invisible: Left and Right only resize while the help card is open, and
+   * outside it they move the selection. Someone pressing Right on the
+   * catalogue sees the selection walk along a row and reasonably concludes
+   * the setting does nothing.
+   */
+  function navBadgeText() {
+    return 'MBP ' + BUILD_VERSION + '  \u00b7  ' +
+           Math.round(navScaleGet() * 100) + '%  \u00b7  Blue = menu';
+  }
+
+  function navBadge() {
+    if (!nav.badge || !navAttached(nav.badge)) {
+      nav.badge = el('div',
+        'position:fixed;right:10px;bottom:8px;z-index:2147483645;' +
+        'font:14px/1 system-ui,Arial,sans-serif;color:rgba(255,255,255,.62);' +
+        'background:rgba(0,0,0,.5);padding:6px 10px;border-radius:6px;' +
+        'pointer-events:none');
+      nav.badge.setAttribute('data-mbp-nav', 'badge');
+      (D.body || D.documentElement).appendChild(nav.badge);
+    }
+    var t = navBadgeText();
+    if (nav.badge.textContent !== t) { nav.badge.textContent = t; }
+  }
+
+  function navBadgeRemove() {
+    if (nav.badge && nav.badge.parentNode) { nav.badge.parentNode.removeChild(nav.badge); }
+    nav.badge = null;
+  }
+
   function navStart() {
     if (nav.on || state.tookOver) return;
     nav.on = true;
     navScaleApply();
+    navBadge();
     registerKeys();
     D.addEventListener('keydown', navKey, true);
     nav.scrollFn = function () { navDrawRing(); };
@@ -2504,6 +2555,7 @@
     // render often has nothing pickable in it yet.
     nav.pick = setInterval(function () {
       if (!nav.on) { clearInterval(nav.pick); nav.pick = null; return; }
+      navBadge();   // pages replace their body; the stamp has to survive that
       if (nav.focus && navAttached(nav.focus) && navShown(nav.focus)) {
         navStuckTick(true);
         navDrawRing();
@@ -2518,6 +2570,7 @@
   function navStop() {
     if (!nav.on) return;
     nav.on = false;
+    navBadgeRemove();
     D.removeEventListener('keydown', navKey, true);
     if (nav.scrollFn) { W.removeEventListener('scroll', nav.scrollFn, true); nav.scrollFn = null; }
     if (nav.resizeFn) { W.removeEventListener('resize', nav.resizeFn); nav.resizeFn = null; }
