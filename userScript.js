@@ -76,7 +76,7 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.6.6';
+  var BUILD_VERSION = '0.6.7';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
@@ -125,6 +125,16 @@
     // So the automatic choice stays at or below this, with the newer codecs
     // off. Anything above it is a deliberate choice made in the settings
     // panel, remembered, and steppable back down the same way.
+    // This is the ceiling on the AUTOMATIC choice only, and it stays at 1080
+    // deliberately. Raising it to 2160 was tried on 13 November 2026 and the
+    // self-test refused it: "the automatic choice declines a rung nothing has
+    // proven". That guard is right. Nothing has demonstrated 4K playback on
+    // this set, and choosing it unasked is how the earlier hang happened.
+    //
+    // 4K is NOT unavailable: usableRungs() offers every rung the set claims,
+    // 2160p included, so it can be chosen in the quality panel - and rungPref
+    // remembers it, so choosing it once makes it the choice from then on.
+    // Offered, remembered, but never assumed.
     maxHeight: 1080,
     maxMbps: 40,
     // Measured on the live site, 13 November 2026: of the five rungs a title
@@ -1154,7 +1164,14 @@
       if (state.guard) { try { state.guard.disconnect(); } catch (e6) {} }
     } catch (e) {}
     setTimeout(function () {
-      try { W.location.href = href; } catch (err) {}
+      /* replace(), not href. Leaving the player with href PUSHES a new
+       * entry, so history reads [home, title?play=1, title] and the next
+       * Back walks straight into the play=1 entry and starts playing
+       * again. Reported from the Frame: Back worked once, then went back
+       * to the player. replace() consumes the play=1 entry instead. */
+      try { W.location.replace(href); } catch (err) {
+        try { W.location.href = href; } catch (err2) {}
+      }
     }, 0);
   }
 
