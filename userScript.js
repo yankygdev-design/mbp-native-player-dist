@@ -76,7 +76,7 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.4.5';
+  var BUILD_VERSION = '0.4.6';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
@@ -2231,6 +2231,80 @@
   // ---------------------------------------------------------------- help card
   // One key, and it says what every other key does. The colour keys are
   // otherwise undiscoverable without the README, which is no use on a sofa.
+  /* ------------------------------------------------- why did it not take over
+   *
+   * Reported from hardware, 12 November 2026: a title played, but in the
+   * SITE'S player - spinner in the middle, a small x top-left, no title and no
+   * progress bar. Ours has no spinner and always shows both. So the takeover
+   * never fired on the live site, and pressing OK reached the site's own
+   * control instead of our pause.
+   *
+   * takeOver() waits for one inline <script> carrying BOTH `qualityLevels`
+   * and `sources`. Something about that is wrong for the live page, and the
+   * stranded-page banner cannot report it: that page HAS something selectable
+   * (the x), so the banner correctly stays quiet.
+   *
+   * Rather than guess at the shape of a page nobody here can load - the site
+   * is signed-in-only and a developer machine gets the gate page - ask the
+   * page itself, on a key the user already presses.
+   *
+   * NAMES ONLY, NEVER VALUES. A player page's variables hold signed URLs and
+   * account identifiers, and this screen gets photographed and sent to me.
+   * Counting a name is enough to say which branch of the parser should run;
+   * printing its value would put a session on a photograph. */
+  var DETECT_MARKERS = ['qualityLevels', 'sources', 'playerData', 'player_data',
+                        'videoUrl', 'video_url', 'mp4_id', 'srt_path', 'playlist',
+                        'hls', 'm3u8'];
+
+  function navDetectReport() {
+    var tags = D.getElementsByTagName('script');
+    var inline = 0, bytes = 0, both = 0, i, j, txt;
+    var hits = {};
+    for (j = 0; j < DETECT_MARKERS.length; j++) { hits[DETECT_MARKERS[j]] = 0; }
+
+    for (i = 0; i < tags.length; i++) {
+      if (tags[i].src) { continue; }
+      txt = tags[i].textContent || '';
+      inline++; bytes += txt.length;
+      for (j = 0; j < DETECT_MARKERS.length; j++) {
+        if (txt.indexOf(DETECT_MARKERS[j]) >= 0) { hits[DETECT_MARKERS[j]]++; }
+      }
+      if (txt.indexOf('qualityLevels') >= 0 && txt.indexOf('sources') >= 0) { both++; }
+    }
+
+    return { inline: inline, bytes: bytes, both: both, hits: hits,
+             external: tags.length - inline,
+             video: D.getElementsByTagName('video').length,
+             tookOver: !!state.tookOver };
+  }
+
+  function navDetectHtml() {
+    var d = navDetectReport(), j, name, line = '';
+    for (j = 0; j < DETECT_MARKERS.length; j++) {
+      name = DETECT_MARKERS[j];
+      if (d.hits[name]) { line += name + ' x' + d.hits[name] + '   '; }
+    }
+    if (!line) { line = '(none of the markers appear in any inline script)'; }
+
+    return '<div style="margin-top:22px;padding-top:16px;' +
+      'border-top:1px solid rgba(255,255,255,.18)">' +
+      '<div style="font-size:21px;font-weight:600;margin-bottom:8px">Player detection</div>' +
+      '<div style="font:15px/1.6 monospace;color:#cfe0ef;white-space:pre-wrap">' +
+      'took over       ' + (d.tookOver ? 'YES' : 'no') + '\n' +
+      'inline scripts  ' + d.inline + '  (' + d.bytes + ' bytes)\n' +
+      // NO ANGLE BRACKETS IN ANY OF THIS TEXT. It goes in through innerHTML,
+      // and the first cut wrote a literal <script> here: that opens a script
+      // element, so everything after it became raw script content and the rest
+      // of the card rendered as visible markup instead of a report.
+      'external scripts  ' + d.external + '\n' +
+      'video elements  ' + d.video + '\n' +
+      'both markers in one script  ' + d.both + '   (takeover needs 1 or more)\n' +
+      'markers seen    ' + line +
+      '</div>' +
+      '<div style="font-size:15px;color:rgba(255,255,255,.5);margin-top:8px">' +
+      'Names only - never values. A player page holds signed URLs.</div></div>';
+  }
+
   function navRenderHelp() {
     if (!nav.help) return;
     var rows = [
@@ -2250,6 +2324,7 @@
     }
     h += '<div style="margin-top:20px;font-size:19px;color:rgba(255,255,255,.55)">' +
       'Pick a title and the player takes over by itself.</div>';
+    h += navDetectHtml();
     nav.help.innerHTML = h;
   }
   function navToggleHelp() {
