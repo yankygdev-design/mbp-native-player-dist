@@ -76,7 +76,7 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.5.1';
+  var BUILD_VERSION = '0.5.2';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
@@ -2796,31 +2796,110 @@
     return (v > 0) ? v : fallback;
   }
 
+  /* THE EPISODE LIST IS ALREADY ON THE PAGE.
+   *
+   * The detection card listed these variables on the live detail page:
+   * tv_season_list, season_total, start_season, start_episode, episode_html.
+   * Asking player_tv_episodes over the network was reaching past data that is
+   * sitting in the document, and it came back empty: 'no episodes listed for
+   * season 1'.
+   *
+   * Its shape is NOT known - nobody here can load a signed-in page to look -
+   * so this walks whatever is there rather than assuming a layout, and
+   * reports the shape it found when it fails. Guessing a shape and shipping
+   * it blind is what the last three rounds were.
+   */
+  function flattenEpisodes(node, out, depth) {
+    if (!node || depth > 5 || out.length > 400) { return; }
+    if (Object.prototype.toString.call(node) === '[object Array]') {
+      for (var i = 0; i < node.length; i++) { flattenEpisodes(node[i], out, depth + 1); }
+      return;
+    }
+    if (typeof node !== 'object') { return; }
+
+    /* An episode row is anything carrying an episode number and an id. The id
+     * field is named differently in different parts of this site, so take the
+     * first that is present rather than insisting on one. */
+    var ep = node.episode !== undefined ? node.episode : node.ep;
+    var id = node.tfid || node.fid || node.mp4_id || node.id;
+    if (ep !== undefined && id) {
+      out.push({
+        season: Number(node.season !== undefined ? node.season : (node.s || 0)),
+        episode: Number(ep),
+        id: String(id)
+      });
+    }
+    for (var k in node) {
+      if (Object.prototype.hasOwnProperty.call(node, k)) {
+        flattenEpisodes(node[k], out, depth + 1);
+      }
+    }
+  }
+
+  /* Names only, for the failure message: enough to write the parser next time
+   * without ever printing a value. */
+  function shapeOf(v) {
+    if (v === null || v === undefined) { return 'absent'; }
+    if (Object.prototype.toString.call(v) === '[object Array]') {
+      if (!v.length) { return 'empty array'; }
+      return 'array[' + v.length + '] of ' + shapeOf(v[0]);
+    }
+    if (typeof v !== 'object') { return typeof v; }
+    var keys = [], k;
+    for (k in v) { if (Object.prototype.hasOwnProperty.call(v, k)) { keys.push(k); } }
+    return 'object{' + keys.slice(0, 12).join(',') + '}';
+  }
+
+  function episodesFromPage() {
+    var txt = inlineScriptText(), raw = null;
+    try { raw = extractJson(txt, 'tv_season_list'); } catch (e) { raw = null; }
+    var out = [];
+    if (raw) { flattenEpisodes(raw, out, 0); }
+    return { rows: out, raw: raw };
+  }
+
   /* A film's id in the path may be what the player endpoint wants. A series'
    * is NOT: /tvshow/101 is the series, and the endpoint wants the EPISODE's
    * tfid, so the episode list has to be asked first. */
   function resolvePlayable(req) {
     if (req.kind === 'movie') {
-      return Promise.resolve({ kind: 'movie', id: req.id, note: 'movie id straight from the path' });
+      return Promise.resolve({ kind: 'movie', id: req.id, note: 'movie id from the path' });
     }
+
     var season = pageNumber('start_season', 1);
     var wantEp = pageNumber('start_episode', 1);
+
+    function choose(rows, where) {
+      var i, exact = null, sameSeason = [];
+      for (i = 0; i < rows.length; i++) {
+        if (!rows[i].season || rows[i].season === season) { sameSeason.push(rows[i]); }
+      }
+      var pool = sameSeason.length ? sameSeason : rows;
+      for (i = 0; i < pool.length; i++) {
+        if (pool[i].episode === wantEp) { exact = pool[i]; break; }
+      }
+      var pick = exact || pool[0];
+      return { kind: 'tv', id: pick.id,
+               note: where + ' s' + season + 'e' + pick.episode +
+                     ' of ' + pool.length + (exact ? '' : ' (nearest)') };
+    }
+
+    /* The page first: the data is already here and needs no round trip. */
+    var page = episodesFromPage();
+    if (page.rows.length) {
+      return Promise.resolve(choose(page.rows, 'from the page,'));
+    }
+
+    /* Then the network, and if that is empty too, say what the page actually
+     * held so the parser can be written rather than guessed at again. */
     return episodesFor(req.id, season).then(function (list) {
-      if (!list || !list.length) {
-        throw new Error('no episodes listed for season ' + season);
-      }
-      var pick = null, i;
-      for (i = 0; i < list.length; i++) {
-        if (Number(list[i].episode) === Number(wantEp)) { pick = list[i]; break; }
-      }
-      if (!pick) { pick = list[0]; }
-      var tfid = pick.tfid || pick.fid || pick.id;
-      if (!tfid) { throw new Error('episode row carries no tfid'); }
-      return { kind: 'tv', id: String(tfid),
-               note: 's' + season + 'e' + wantEp + ' of ' + list.length };
+      var rows = [];
+      if (list) { flattenEpisodes(list, rows, 0); }
+      if (rows.length) { return choose(rows, 'from the api,'); }
+      throw new Error('no episodes anywhere. tv_season_list was ' +
+                      shapeOf(page.raw) + '; the api returned ' + shapeOf(list));
     });
   }
-
   function tryInlinePlay(req) {
     state.playAttempt = 'resolving ' + req.kind + ' ' + req.id;
 
