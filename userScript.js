@@ -76,7 +76,7 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.6.3';
+  var BUILD_VERSION = '0.6.4';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
@@ -431,18 +431,29 @@
   // Every rung this set can decode at all, lowest first. The HEVC test here is
   // a hard gate (the set cannot play it), not a quality ceiling -- the ceiling
   // lives in pickRung, so the panel can still offer a climb above it.
+  /* What the quality panel may OFFER.
+   *
+   * It used to offer every rung the set claimed it could decode. On the live
+   * site that means four playlists this player cannot open at all, so walking
+   * the list handed the decoder one unplayable source after another - which
+   * is the likeliest way to wedge a TV's media pipeline, and on the Frame the
+   * whole remote stopped responding and the player could not be left.
+   *
+   * So the panel offers what can actually play: direct sources when any
+   * exist, and playlists only when there is nothing else - the same order
+   * pickRung uses, for the same reason. Offering a choice that breaks the set
+   * is not a choice. */
   function usableRungs() {
-    var d = state.data, out = [], i;
-    if (!d || !d.quality) return out;
+    var d = state.data, direct = [], playlists = [], i;
+    if (!d || !d.quality) { return []; }
     for (i = 0; i < d.quality.length; i++) {
       var q = d.quality[i];
-      // ORG belongs in the list: it is frequently the only rung with a source
-      // this element can open, and hiding it left the quality panel offering
-      // nothing but playlists that fail on selection.
-      if (!q.sources || !q.sources[0] || !q.sources[0].src) continue;
-      if (q.sources[0].h265 && !SUPPORTS_HEVC) continue;
-      out.push({ i: i, h: rungHeight(q), q: q });
+      if (!q.sources || !q.sources[0] || !q.sources[0].src) { continue; }
+      if (q.sources[0].h265 && !SUPPORTS_HEVC) { continue; }
+      var row = { i: i, h: rungHeight(q), q: q };
+      if (sourceIsHls(q)) { playlists.push(row); } else { direct.push(row); }
     }
+    var out = direct.length ? direct : playlists;
     out.sort(function (a, b) { return a.h - b.h; });
     return out;
   }
@@ -544,6 +555,10 @@
     // session-scoped: survives an episode change (see endEpisode)
     wired: false, progressTimer: null, subOn: true, tookOver: false,
     guard: null, hidden: 0,
+    // the last exception a key handler threw, if any. Session-scoped: it
+    // describes this run, not this episode, and it is the only trace left
+    // when a handler fails on a device with no console.
+    lastKeyError: null,
     // what the inline-play attempt did, reported on the Blue card
     playAttempt: 'not attempted',
     // the href the attempt was made for, so a single-page navigation is
@@ -1799,10 +1814,28 @@
     okShortPress();
   }
 
+  /* Every key goes through here, so a throw in ANY handler below would make
+   * the whole remote look dead - including Back, which is the one key that
+   * must always work. A viewer who cannot leave the player has to pull the
+   * plug, and that is never an acceptable outcome of a bug in a settings row.
+   *
+   * So the body is wrapped, and if it throws, Back still leaves. */
   function onKey(e) {
     var a = KEYS[e.keyCode];
     if (!a) return;
     e.preventDefault(); e.stopPropagation();
+    try {
+      onKeyInner(a, e);
+    } catch (err) {
+      state.lastKeyError = (err && err.message) ? err.message : String(err);
+      if (a === 'back') { leaveToSite('/'); return; }
+      try {
+        osd('Something went wrong - press Back to leave');
+      } catch (e2) {}
+    }
+  }
+
+  function onKeyInner(a, e) {
     // A lost keyup would otherwise leave OK dead for good, so any other key
     // clears the held flag.
     if (a !== 'ok') state.okHeld = false;
