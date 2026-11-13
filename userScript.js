@@ -76,7 +76,7 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.6.4';
+  var BUILD_VERSION = '0.6.5';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
@@ -1629,6 +1629,19 @@
       rows.push({ label: 'Next episode', value: 'OK',
                   ok: function () { closeSettings(); playNext(); } });
     }
+    /* There is no Previous episode, and there cannot be one from here: the
+     * player response carries nextSeason and nextEpisode but nothing pointing
+     * backwards. The series page has the whole list though, so offer that -
+     * it reaches the previous episode and every other one, which is more
+     * useful than a single step back. */
+    if (state.data && state.data.kind === 'tv' && state.data.tid) {
+      rows.push({ label: 'Episode list', value: 'OK',
+                  ok: function () {
+                    closeSettings();
+                    saveProgress();
+                    leaveToSite('/tvshow/' + state.data.tid);
+                  } });
+    }
     rows.push({ label: 'Diagnostics', value: 'OK',
                 ok: function () { closeSettings(); toggleDiag(); } });
     return rows;
@@ -1946,8 +1959,50 @@
     badge: null
   };
 
+  /* Where an element actually DRAWS, which is not always where it measures.
+   *
+   * Measured on the live detail page: the CONTINUE pill is
+   *   <a class="play_btn start_app" href="javascript:;">
+   * with display:inline wrapping block children. Its own box is
+   * x0 y418 w298 h15 - a thin strip - while the pill you can see is
+   * x0 y426 w270 h45. An inline box is the line boxes of its text, not the
+   * blocks inside it.
+   *
+   * That one discrepancy caused both reported symptoms: the focus ring was
+   * drawn faithfully around a rectangle that is not where the button looks,
+   * and spatial navigation scored the element from the wrong place, so moving
+   * towards the pill often missed it entirely.
+   *
+   * So for an inline element, use the union of its visible element children -
+   * measured against the real page, that union is exactly the visible pill.
+   * Block elements already cover their children, so they are left alone and
+   * nothing else changes. */
   function navRect(n) {
     var r = n.getBoundingClientRect();
+    var disp = '';
+    try { disp = navCss(n).display || ''; } catch (e) {}
+
+    if (disp === 'inline') {
+      var kids = n.getElementsByTagName('*');
+      var L = Infinity, T = Infinity, R2 = -Infinity, B = -Infinity, found = 0, i, k, st;
+      for (i = 0; i < kids.length; i++) {
+        try { st = navCss(kids[i]); } catch (e2) { continue; }
+        if (st.display === 'none' || st.visibility === 'hidden') { continue; }
+        k = kids[i].getBoundingClientRect();
+        if (k.width < 2 || k.height < 2) { continue; }
+        if (k.left < L) L = k.left;
+        if (k.top < T) T = k.top;
+        if (k.right > R2) R2 = k.right;
+        if (k.bottom > B) B = k.bottom;
+        found++;
+      }
+      /* Only when the children genuinely describe something bigger. A link
+       * whose children are smaller than its own line boxes is an ordinary
+       * inline link and must keep its own box. */
+      if (found && (B - T) > r.height) {
+        return { l: L, t: T, r: R2, b: B, w: R2 - L, h: B - T };
+      }
+    }
     return { l: r.left, t: r.top, r: r.right, b: r.bottom, w: r.width, h: r.height };
   }
   function navCss(n) { return W.getComputedStyle(n) || {}; }
@@ -3022,6 +3077,7 @@
     navScaleGet: navScaleGet,
     navScaleApply: navScaleApply,
     navScaleNudge: navScaleNudge,
+    navRect: navRect,
     navToggleHelp: navToggleHelp,
     navStart: navStart,
     navStop: navStop,
