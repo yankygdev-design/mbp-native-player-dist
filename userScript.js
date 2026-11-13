@@ -76,7 +76,7 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.6.5';
+  var BUILD_VERSION = '0.6.6';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
@@ -1639,7 +1639,7 @@
                   ok: function () {
                     closeSettings();
                     saveProgress();
-                    leaveToSite('/tvshow/' + state.data.tid);
+                    leaveToSite(titlePath());
                   } });
     }
     rows.push({ label: 'Diagnostics', value: 'OK',
@@ -1877,7 +1877,12 @@
     else if (a === 'green') openSubPanel();
     else if (a === 'next') playNext();
     else if (a === 'prev') osd('Previous episode is not wired up -- press Back for the list');
-    else if (a === 'back') { saveProgress(); leaveToSite('/'); }
+    else if (a === 'back') {
+      /* The title's own page, not the home page: it is where the episode list
+       * is, and without play=1 it will not pull us straight back in. */
+      saveProgress();
+      leaveToSite(titlePath());
+    }
   }
 
   /* ================================================================ navigation
@@ -2296,6 +2301,11 @@
       var tg = n.getAttribute('target');
       if (tg && tg !== '_self') n.setAttribute('target', '_self');  // a new tab is unreachable here
     }
+    /* Pressing the play pill is the viewer asking to play. Take over here
+     * rather than clicking through: the site would start its own player, and
+     * its url does not change, so nothing would ever hand over. */
+    if (isPlayAffordance(n) && playHere()) { return; }
+
     nav.dirty = true;
     navClick(n);
     setTimeout(function () { nav.dirty = true; navDrawRing(); }, 400);
@@ -2598,6 +2608,11 @@
       if (!nav.focus) return;              // nothing selected: let the site have it
       e.preventDefault(); e.stopPropagation();
       navActivate(nav.focus);
+    } else if (a === 'play') {
+      /* An always-available way to start this title with our player, for when
+       * focus is nowhere near the pill or the page has moved it. */
+      e.preventDefault(); e.stopPropagation();
+      playHere();
     } else if (a === 'blue') {
       e.preventDefault(); e.stopPropagation();
       navToggleHelp();
@@ -2941,14 +2956,70 @@
    * pushState, or renders the row later - when the row is there, we can play.
    */
   function playUrlOnPage() {
-    var el = null;
-    try { el = D.querySelector('[oss_download_url]'); } catch (e) { return null; }
-    if (!el) { return null; }
-    var u = el.getAttribute('oss_download_url') || '';
+    var el2 = null;
+    try { el2 = D.querySelector('[oss_download_url]'); } catch (e) { return null; }
+    if (!el2) { return null; }
+    var u = el2.getAttribute('oss_download_url') || '';
     /* Insist on the shape we measured rather than POSTing whatever is in the
      * attribute: this is a url that gets sent, so a surprise here should be
      * ignored rather than followed. */
     return /^\/index\/index\/player\?(?:mfid|tfid)=\d+$/.test(u) ? u : null;
+  }
+
+  /* WHETHER THE VIEWER ASKED TO PLAY - which is not the same as whether a play
+   * url exists on the page.
+   *
+   * Measured: li.play[oss_download_url] is present on EVERY detail page, in a
+   * sidebar, whether or not anyone asked for anything. Treating its presence
+   * as the trigger meant opening a title threw you straight into the player
+   * with no chance to read the synopsis or choose an episode - and worse, Back
+   * returned to the title page where the row was still sitting, so it grabbed
+   * you again immediately. There was no way out of the player at all.
+   *
+   * The site's own signal is play=1 on the url, which is what its cards link
+   * to. Honour that, and otherwise wait to be asked. */
+  function playRequested() {
+    try { return /[?&]play=1(?:&|$)/.test(W.location.search || ''); } catch (e) { return false; }
+  }
+
+  /* The play affordance, which lives in a different part of the page from the
+   * row that carries the url - they are not nested, so neither can be found
+   * from the other. Matched by class, walking up a little, because the pill is
+   * an <a> wrapping blocks and focus may land on any of them. */
+  function isPlayAffordance(n) {
+    var hops = 0;
+    while (n && n.nodeType === 1 && hops++ < 4) {
+      var c = ' ' + String(n.className || '') + ' ';
+      if (c.indexOf(' play_btn ') >= 0 || c.indexOf(' start_app ') >= 0 ||
+          c.indexOf(' play ') >= 0) {
+        return true;
+      }
+      n = n.parentNode;
+    }
+    return false;
+  }
+
+  /* Start our player for the title on this page, if there is one to start. */
+  function playHere() {
+    var u = playUrlOnPage();
+    if (!u) { return false; }
+    state.playTriedFor = u;
+    tryInlinePlay(u);
+    return true;
+  }
+
+  /* Where this title lives, so leaving the player lands somewhere useful -
+   * the title's own page, WITHOUT play=1, so it stays there instead of being
+   * pulled straight back in. */
+  function titlePath() {
+    var d = state.data;
+    if (d) {
+      if (d.kind === 'tv' && d.tid) { return '/tvshow/' + d.tid; }
+      if (d.kind === 'movie' && d.mid) { return '/movie/' + d.mid; }
+      if (d.tid) { return '/tvshow/' + d.tid; }
+      if (d.mid) { return '/movie/' + d.mid; }
+    }
+    return '/';
   }
 
   function tryInlinePlay(url) {
@@ -3002,6 +3073,7 @@
    * attempted, so one row produces one attempt rather than one per tick. */
   function playWatchTick() {
     if (state.tookOver) { return; }
+    if (!playRequested()) { return; }      // the row is always there; consent is not
     var u = playUrlOnPage();
     if (!u || u === state.playTriedFor) { return; }
     state.playTriedFor = u;
