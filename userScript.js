@@ -76,7 +76,7 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.6.1';
+  var BUILD_VERSION = '0.6.2';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
@@ -127,7 +127,19 @@
     // panel, remembered, and steppable back down the same way.
     maxHeight: 1080,
     maxMbps: 40,
-    allowHevc: false,
+    // Measured on the live site, 13 November 2026: of the five rungs a title
+    // offers, exactly ONE is an mp4 - 'ORG' - and it is H.265. Every other
+    // rung is HLS, which a bare <video src> cannot play at all; the site gets
+    // away with them only because it ships hls.js and feeds MediaSource.
+    //
+    // So refusing H.265 does not mean 'play something safer', it means 'play
+    // nothing'. That combination - ORG skipped, H.265 refused - is what put a
+    // black screen on the Frame with error 4 (SRC_NOT_SUPPORTED).
+    //
+    // It is still gated on the engine actually reporting HEVC support, and on
+    // that set it does: project 3's probe row #10 read hevc(mse=y,el=probably)
+    // on the same panel.
+    allowHevc: true,
     seekStep: 10,
     seekStepBig: 60,
     progressEvery: 60000,
@@ -355,6 +367,17 @@
     var u = (navigator.userAgent || '').toLowerCase();
     return /tizen|smart-tv|hbbtv|orsay/.test(u) || (/samsung/.test(u) && /\btv\b/.test(u));
   }
+  /* Whether the SOURCE is a playlist, with no special case for ORG.
+   * isHls() below answers a different question - it decides whether to force
+   * AAC - and it deliberately treats ORG as not-HLS. Using it to decide
+   * playability would have hidden the very thing that broke playback. */
+  function sourceIsHls(q) {
+    var s2 = q && q.sources && q.sources[0];
+    if (!s2) { return false; }
+    var t = String(s2.type || '').toLowerCase();
+    return t.indexOf('mpegurl') >= 0 || /\.m3u8(\?|$)/i.test(String(s2.src || ''));
+  }
+
   function isHls(q) {
     var s = q && q.sources && q.sources[0];
     if (!s) return false;
@@ -400,7 +423,9 @@
     if (!d || !d.quality) return out;
     for (i = 0; i < d.quality.length; i++) {
       var q = d.quality[i];
-      if (String(q.name || '').toUpperCase() === 'ORG') continue;
+      // ORG belongs in the list: it is frequently the only rung with a source
+      // this element can open, and hiding it left the quality panel offering
+      // nothing but playlists that fail on selection.
       if (!q.sources || !q.sources[0] || !q.sources[0].src) continue;
       if (q.sources[0].h265 && !SUPPORTS_HEVC) continue;
       out.push({ i: i, h: rungHeight(q), q: q });
@@ -449,16 +474,45 @@
         return k;
       }
     }
-    var best = -1, bestH = -1;
-    for (var i = 0; i < levels.length; i++) {
-      var q = levels[i], name = String(q.name || '').toUpperCase();
-      if (name === 'ORG') continue;                       // unknown codec/audio
-      if (!q.sources || !q.sources[0] || !q.sources[0].src) continue;
-      if (q.sources[0].h265 && !(SUPPORTS_HEVC && CFG.allowHevc)) continue;
-      var h = rungHeight(q);
-      if (h && h > CFG.maxHeight) continue;
-      if (CFG.maxMbps && rungMbps(q) > CFG.maxMbps) continue;
-      if (h > bestH || (h === bestH && name === 'AUTO')) { bestH = h; best = i; }
+    /* THREE PASSES, in order of how much we trust them.
+     *
+     * The self-test guards a rule learned from a wedged set: never auto-pick
+     * HEVC while something else will play, because a codec string is the
+     * decoder saying it can, not evidence that it does. That rule is right
+     * and is kept.
+     *
+     * But measured on the live site, a title offers five rungs of which
+     * exactly one is an mp4 - 'ORG' - and it is H.265. Every other rung is a
+     * playlist, which a bare <video src> cannot open at all. So refusing HEVC
+     * outright does not mean 'play something safer', it means 'play nothing',
+     * and that is the black screen with error 4 on the Frame.
+     *
+     *   pass 0  a direct source that is not HEVC      - trusted
+     *   pass 1  a direct source that is HEVC          - last resort, and only
+     *                                                   if the set claims it
+     *   pass 2  a playlist                            - may work on a set with
+     *                                                   native HLS; nothing is
+     *                                                   lost by trying
+     *
+     * ORG is no longer skipped outright. It was skipped as 'unknown
+     * codec/audio', but it declares its codec plainly and is routinely the
+     * only thing on the page that can actually play. */
+    var best = -1, bestH = -1, pass;
+    for (pass = 0; pass < 3 && best < 0; pass++) {
+      for (var i = 0; i < levels.length; i++) {
+        var q = levels[i], name = String(q.name || '').toUpperCase();
+        if (!q.sources || !q.sources[0] || !q.sources[0].src) continue;
+
+        var hls = sourceIsHls(q), h265 = !!q.sources[0].h265;
+        if (pass < 2 && hls) continue;                  // a playlist is pass 2
+        if (pass === 0 && h265) continue;               // HEVC is pass 1
+        if (h265 && !(SUPPORTS_HEVC && CFG.allowHevc)) continue;
+
+        var h = rungHeight(q);
+        if (h && h > CFG.maxHeight) continue;
+        if (CFG.maxMbps && rungMbps(q) > CFG.maxMbps) continue;
+        if (h > bestH || (h === bestH && name === 'AUTO')) { bestH = h; best = i; }
+      }
     }
     if (best < 0) { for (var j = 0; j < levels.length; j++) if (levels[j].sources && levels[j].sources[0]) return j; }
     return best;
@@ -1191,10 +1245,26 @@
       });
       ui.video.addEventListener('error', function () {
         var e = ui.video.error;
-        // A network/src failure on a signed URL is nearly always expiry, and
-        // the fix is to fetch the player page again rather than to give up.
-        if (e && (e.code === 2 || e.code === 4) && !state.recovering) {
+        // Code 2 is a NETWORK failure, which on a signed url is nearly always
+        // expiry, and re-fetching the player page is the right answer.
+        if (e && e.code === 2 && !state.recovering) {
           refreshLink('Source failed, refreshing link...');
+          return;
+        }
+        // Code 4 is SRC_NOT_SUPPORTED: this engine cannot decode this source
+        // AT ALL. Refreshing fetches the identical unplayable url, so treating
+        // 4 as expiry burned the one recovery attempt and left a black screen
+        // with no explanation - which is exactly what happened on the Frame
+        // with an HLS rung. Say what is wrong instead.
+        if (e && e.code === 4) {
+          var q = state.data && state.data.quality && state.data.quality[state.rung];
+          var kind = q && sourceIsHls(q) ? 'a playlist (HLS), which this player cannot open directly'
+                                         : 'a format this player cannot decode';
+          showMsg('This quality will not play here',
+                  el('div', 'color:#8fa3b8;font-size:14px',
+                     'The chosen source is ' + kind + '.'),
+                  el('div', 'color:#8fa3b8;font-size:14px',
+                     'Hold OK for settings and change Quality, or press Back to return.'));
           return;
         }
         showMsg('Playback failed' + (e ? ' (code ' + e.code + ')' : ''),
