@@ -76,7 +76,7 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.4.3';
+  var BUILD_VERSION = '0.4.4';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
@@ -1812,7 +1812,10 @@
     on: false, focus: null, ring: null, scaleEl: null, help: null,
     stamp: 0, cache: null, cacheAt: 0, cacheY: 0, dirty: true,
     lastMove: 0, obs: null, pick: null, scrollFn: null, resizeFn: null,
-    harvestMs: 0, harvestN: 0
+    harvestMs: 0, harvestN: 0,
+    // the stranded-page watch: when we first noticed nothing was selectable,
+    // and the overlay that says so. Cleared the moment the page becomes usable.
+    stuckSince: 0, stuckBox: null
   };
 
   function navRect(n) {
@@ -2232,6 +2235,14 @@
       e.preventDefault(); e.stopPropagation();
       navToggleHelp();
     } else if (a === 'back') {
+      // On a stranded page Back MUST do something. history.back() can land on
+      // the same dead page, so from here go to the catalogue outright -- the
+      // one place known to work.
+      // The banner takes the page's word for nothing: Back keeps its normal
+      // meaning. The trigger can be a false alarm, so the escape must be
+      // correct in both cases - and history.back() from a stranded player
+      // page lands on the detail page, which is a fine way out.
+      navStuckHide();
       // Do NOT swallow Back at the bottom of the history stack: on Tizen that
       // is how someone leaves the app, and eating it traps them in the browser.
       if (W.history.length > 1) {
@@ -2239,6 +2250,94 @@
         W.history.back();
       }
     }
+  }
+
+  /* ----------------------------------------------------- the stuck-page watch
+   *
+   * Reported from hardware 12 November 2026: pressing OK on a title opened the
+   * site's own player page, which then sat on a spinner forever.
+   *
+   * The module takes over only once an inline script carrying both
+   * `qualityLevels` and `sources` appears. When that page never produces one
+   * there is nothing to take over - and the module said NOTHING, so the site's
+   * spinner was the only thing on screen. A silent wait is indistinguishable
+   * from a crash, and there was no way back short of the home key.
+   *
+   * This does NOT fix the site's page. It makes the failure visible, reports
+   * the facts needed to diagnose it, and gives the remote a way out. Every
+   * problem solved on this project was solved by a screen that said what it
+   * could see; this is that screen for the one place that had none.
+   *
+   * The trigger is deliberately not 'are we on a player URL' - the module
+   * should not have to know the site's URL shapes to notice it is stranded.
+   * The condition is simply: nothing on this page can be selected, and no
+   * player data has appeared, for long enough that it cannot be slow loading.
+   */
+  /* Ten seconds, not six. The condition cannot distinguish 'dead page' from
+   * 'page whose controls I do not recognise', so it should err late. */
+  var STUCK_AFTER_MS = 10000;
+
+  /* What we can see of the page, in the terms that actually decide takeover. */
+  function navStuckScan() {
+    var s = D.getElementsByTagName('script'), i, txt;
+    var inline = 0, bytes = 0, q = 0, src = 0;
+    for (i = 0; i < s.length; i++) {
+      if (s[i].src) { continue; }
+      txt = s[i].textContent || '';
+      inline++; bytes += txt.length;
+      if (txt.indexOf('qualityLevels') >= 0) { q++; }
+      if (txt.indexOf('sources') >= 0) { src++; }
+    }
+    return { inline: inline, bytes: bytes, quality: q, sources: src };
+  }
+
+  function navStuckHide() {
+    if (nav.stuckBox && nav.stuckBox.parentNode) {
+      nav.stuckBox.parentNode.removeChild(nav.stuckBox);
+    }
+    nav.stuckBox = null;
+  }
+
+  function navStuckShow(secs) {
+    var d = navStuckScan();
+    if (!nav.stuckBox) {
+      /* A strip along the bottom, NOT a full-screen cover. This can be wrong -
+       * 'nothing I can select' is not the same as 'this page is dead' - so the
+       * cost of being wrong has to stay small. Under the focus ring
+       * (2147483646) so a ring is never hidden by a note about being stuck. */
+      nav.stuckBox = el('div',
+        'position:fixed;left:0;right:0;bottom:0;z-index:2147483640;' +
+        'background:rgba(6,8,12,.93);color:#eef;' +
+        'font:17px/1.45 system-ui,Arial,sans-serif;padding:16px 28px;' +
+        'border-top:2px solid #7fd0ff');
+      D.body.appendChild(nav.stuckBox);
+    }
+    nav.stuckBox.innerHTML = '';
+    nav.stuckBox.appendChild(el('div', 'font-weight:700;margin-bottom:4px',
+      'Waiting for the player - ' + secs + 's. Nothing here can be selected yet.'));
+    nav.stuckBox.appendChild(el('div',
+      'font:14px/1.5 monospace;opacity:.85',
+      (function () {
+        var u = '(unavailable)';
+        try { u = String(W.location.pathname + W.location.search).slice(0, 90); } catch (e) {}
+        return u + '   ' + D.readyState +
+               '   inline scripts ' + d.inline + ' (' + d.bytes + 'b)' +
+               '   qualityLevels ' + d.quality + '   sources ' + d.sources;
+      }())));
+    nav.stuckBox.appendChild(el('div', 'font-size:14px;opacity:.75;margin-top:4px',
+      'Takeover needs both markers in the SAME script. Press BACK to go back.'));
+  }
+  /* Called from the existing nav tick, so it adds no second timer. */
+  function navStuckTick(hasCandidates) {
+    if (state.tookOver) { navStuckHide(); return; }
+    if (hasCandidates || playerDataInPage()) {
+      nav.stuckSince = 0;
+      navStuckHide();
+      return;
+    }
+    if (!nav.stuckSince) { nav.stuckSince = now(); return; }
+    var ms = now() - nav.stuckSince;
+    if (ms >= STUCK_AFTER_MS) { navStuckShow(Math.round(ms / 1000)); }
   }
 
   function navStart() {
@@ -2261,8 +2360,13 @@
     // render often has nothing pickable in it yet.
     nav.pick = setInterval(function () {
       if (!nav.on) { clearInterval(nav.pick); nav.pick = null; return; }
-      if (nav.focus && navAttached(nav.focus) && navShown(nav.focus)) { navDrawRing(); return; }
+      if (nav.focus && navAttached(nav.focus) && navShown(nav.focus)) {
+        navStuckTick(true);
+        navDrawRing();
+        return;
+      }
       var c = navCandidates();
+      navStuckTick(c.length > 0);
       if (c.length) navSetFocus(navPickFirst(c));
     }, 700);
   }
