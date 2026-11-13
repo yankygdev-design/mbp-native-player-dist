@@ -76,7 +76,7 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.5.2';
+  var BUILD_VERSION = '0.6.0';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
@@ -2745,206 +2745,96 @@
     return m ? { kind: m[1], id: m[2] } : null;
   }
 
-  /* ================================================ the site plays INLINE
+  /* =================================== how a title actually starts playing
    *
-   * Measured on the live site, 12 November 2026. Picking a title lands on
+   * Read off the live site on 13 November 2026, in a signed-in browser, after
+   * four releases of guessing at it from photographs. The page does the work
+   * for us and always did:
    *
-   *     /tvshow/101?from=home&play=1
+   *     <li class="play" oss_download_url="/index/index/player?mfid=456177">
+   *     <li class="play" oss_download_url="/index/index/player?tfid=854459">
    *
-   * THERE IS NO SEPARATE PLAYER PAGE. The site plays on the detail page, with
-   * `play=1` appended. watchForPlayer() has been waiting for a page that does
-   * not exist, and the markers it waits for - qualityLevels and sources - are
-   * nowhere in that page's 141 KB of inline script either. What is there is
-   * url2, oss_url2 and oss_download_url, and the video element's source is a
-   * blob:, so the site feeds MediaSource from script and there is no url on
-   * the element to adopt.
+   * The complete request - endpoint, parameter name, id - is sitting in an
+   * attribute. POSTing it returns the same HTML fragment the parser already
+   * reads: 582 KB carrying both qualityLevels and sources.
    *
-   * So stop scraping the page and ask the API, which is what the module
-   * already does for a forced open (devOpenRequest -> bootFetch) and what it
-   * was developed against. Same-origin here, so the session rides along.
+   * Everything this replaces was unnecessary. The id in the path is NOT the
+   * id the player wants (/movie/13600 plays mfid=456177), the episode list
+   * never needed walking, and player_tv_episodes never needed calling. The
+   * site names the parameter correctly for the type, so films and series are
+   * the same code path.
    *
-   * THE ATTEMPT IS NON-DESTRUCTIVE, deliberately. The site's own player works
-   * - badly, but it works. So fetch FIRST and take over only on success: a
-   * failure must leave the site's player alone rather than replacing a
-   * working picture with our error screen. Whatever happens is recorded in
-   * state.playAttempt and shown on the Blue card.
+   * Triggering on the ATTRIBUTE rather than on the url also drops the last
+   * assumption: it does not matter whether the site navigates, uses
+   * pushState, or renders the row later - when the row is there, we can play.
    */
-  function playRequestFromUrl() {
-    var path = '', search = '';
-    try { path = W.location.pathname || ''; search = W.location.search || ''; } catch (e) { return null; }
-    if (!/[?&]play=1(?:&|$)/.test(search)) { return null; }
-    var m = /\/(tvshow|movie)\/(\d+)/.exec(path);
-    if (!m) { return null; }
-    return { kind: (m[1] === 'movie') ? 'movie' : 'tv', id: m[2] };
+  function playUrlOnPage() {
+    var el = null;
+    try { el = D.querySelector('[oss_download_url]'); } catch (e) { return null; }
+    if (!el) { return null; }
+    var u = el.getAttribute('oss_download_url') || '';
+    /* Insist on the shape we measured rather than POSTing whatever is in the
+     * attribute: this is a url that gets sent, so a surprise here should be
+     * ignored rather than followed. */
+    return /^\/index\/index\/player\?(?:mfid|tfid)=\d+$/.test(u) ? u : null;
   }
 
-  /* The inline scripts, joined, so the existing scalar reader can be pointed
-   * at them. The page carries start_season and start_episode, which is how it
-   * knows which episode it is about to play. */
-  function inlineScriptText() {
-    var tags = D.getElementsByTagName('script'), out = [], i;
-    for (i = 0; i < tags.length; i++) {
-      if (!tags[i].src) { out.push(tags[i].textContent || ''); }
-    }
-    return out.join('\n');
-  }
+  function tryInlinePlay(url) {
+    state.playAttempt = 'fetching';
 
-  function pageNumber(name, fallback) {
-    var v;
-    try { v = extractScalar(inlineScriptText(), name); } catch (e) { return fallback; }
-    v = parseInt(v, 10);
-    return (v > 0) ? v : fallback;
-  }
-
-  /* THE EPISODE LIST IS ALREADY ON THE PAGE.
-   *
-   * The detection card listed these variables on the live detail page:
-   * tv_season_list, season_total, start_season, start_episode, episode_html.
-   * Asking player_tv_episodes over the network was reaching past data that is
-   * sitting in the document, and it came back empty: 'no episodes listed for
-   * season 1'.
-   *
-   * Its shape is NOT known - nobody here can load a signed-in page to look -
-   * so this walks whatever is there rather than assuming a layout, and
-   * reports the shape it found when it fails. Guessing a shape and shipping
-   * it blind is what the last three rounds were.
-   */
-  function flattenEpisodes(node, out, depth) {
-    if (!node || depth > 5 || out.length > 400) { return; }
-    if (Object.prototype.toString.call(node) === '[object Array]') {
-      for (var i = 0; i < node.length; i++) { flattenEpisodes(node[i], out, depth + 1); }
-      return;
-    }
-    if (typeof node !== 'object') { return; }
-
-    /* An episode row is anything carrying an episode number and an id. The id
-     * field is named differently in different parts of this site, so take the
-     * first that is present rather than insisting on one. */
-    var ep = node.episode !== undefined ? node.episode : node.ep;
-    var id = node.tfid || node.fid || node.mp4_id || node.id;
-    if (ep !== undefined && id) {
-      out.push({
-        season: Number(node.season !== undefined ? node.season : (node.s || 0)),
-        episode: Number(ep),
-        id: String(id)
-      });
-    }
-    for (var k in node) {
-      if (Object.prototype.hasOwnProperty.call(node, k)) {
-        flattenEpisodes(node[k], out, depth + 1);
+    fetch(url, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    }).then(function (r) {
+      if (!r.ok) { throw new Error('player ' + r.status); }
+      return r.text();
+    }).then(function (txt) {
+      if (isUnauthenticated(txt)) {
+        var e = new Error('not signed in');
+        e.needsAuth = true;
+        throw e;
       }
-    }
-  }
+      if (state.tookOver) { return; }
 
-  /* Names only, for the failure message: enough to write the parser next time
-   * without ever printing a value. */
-  function shapeOf(v) {
-    if (v === null || v === undefined) { return 'absent'; }
-    if (Object.prototype.toString.call(v) === '[object Array]') {
-      if (!v.length) { return 'empty array'; }
-      return 'array[' + v.length + '] of ' + shapeOf(v[0]);
-    }
-    if (typeof v !== 'object') { return typeof v; }
-    var keys = [], k;
-    for (k in v) { if (Object.prototype.hasOwnProperty.call(v, k)) { keys.push(k); } }
-    return 'object{' + keys.slice(0, 12).join(',') + '}';
-  }
-
-  function episodesFromPage() {
-    var txt = inlineScriptText(), raw = null;
-    try { raw = extractJson(txt, 'tv_season_list'); } catch (e) { raw = null; }
-    var out = [];
-    if (raw) { flattenEpisodes(raw, out, 0); }
-    return { rows: out, raw: raw };
-  }
-
-  /* A film's id in the path may be what the player endpoint wants. A series'
-   * is NOT: /tvshow/101 is the series, and the endpoint wants the EPISODE's
-   * tfid, so the episode list has to be asked first. */
-  function resolvePlayable(req) {
-    if (req.kind === 'movie') {
-      return Promise.resolve({ kind: 'movie', id: req.id, note: 'movie id from the path' });
-    }
-
-    var season = pageNumber('start_season', 1);
-    var wantEp = pageNumber('start_episode', 1);
-
-    function choose(rows, where) {
-      var i, exact = null, sameSeason = [];
-      for (i = 0; i < rows.length; i++) {
-        if (!rows[i].season || rows[i].season === season) { sameSeason.push(rows[i]); }
-      }
-      var pool = sameSeason.length ? sameSeason : rows;
-      for (i = 0; i < pool.length; i++) {
-        if (pool[i].episode === wantEp) { exact = pool[i]; break; }
-      }
-      var pick = exact || pool[0];
-      return { kind: 'tv', id: pick.id,
-               note: where + ' s' + season + 'e' + pick.episode +
-                     ' of ' + pool.length + (exact ? '' : ' (nearest)') };
-    }
-
-    /* The page first: the data is already here and needs no round trip. */
-    var page = episodesFromPage();
-    if (page.rows.length) {
-      return Promise.resolve(choose(page.rows, 'from the page,'));
-    }
-
-    /* Then the network, and if that is empty too, say what the page actually
-     * held so the parser can be written rather than guessed at again. */
-    return episodesFor(req.id, season).then(function (list) {
-      var rows = [];
-      if (list) { flattenEpisodes(list, rows, 0); }
-      if (rows.length) { return choose(rows, 'from the api,'); }
-      throw new Error('no episodes anywhere. tv_season_list was ' +
-                      shapeOf(page.raw) + '; the api returned ' + shapeOf(list));
-    });
-  }
-  function tryInlinePlay(req) {
-    state.playAttempt = 'resolving ' + req.kind + ' ' + req.id;
-
-    resolvePlayable(req).then(function (p) {
-      state.playAttempt = 'fetching (' + (p.note || '') + ')';
-      return fetchPlayer(p, 0).then(function (txt) {
-        if (state.tookOver) { return; }      // something else got there first
-        state.playAttempt = 'took over';
-        navStop();
-        buildUi();
-        D.addEventListener('keydown', onKey, true);
-        D.addEventListener('keyup', onKeyUp, true);
-        registerKeys();
-        state.tookOver = true;
-        marks.takeoverAt = now();
+      /* Take over only now, with the data in hand. If start() throws, the
+         page has already been replaced, so put the remote back in a state
+         the user can escape from rather than leaving a dead screen. */
+      navStop();
+      buildUi();
+      D.addEventListener('keydown', onKey, true);
+      D.addEventListener('keyup', onKeyUp, true);
+      registerKeys();
+      state.tookOver = true;
+      marks.takeoverAt = now();
+      try {
         start(txt);
-      });
+        state.playAttempt = 'took over';
+      } catch (e2) {
+        state.playAttempt = 'took over but start() threw: ' + (e2 && e2.message);
+        showMsg(el('div', 'font-size:22px;font-weight:600', 'Could not read the player data'),
+                el('div', 'color:#ff8f8f', String(e2 && e2.message || e2)),
+                el('div', 'color:#8fa3b8;font-size:14px', 'Press Back to return to the site.'));
+      }
     })['catch'](function (e) {
-      // Leave the site's player running. Record why, and say so on the card.
+      /* Leave the site's player alone. It works, badly, and replacing a
+         working picture with our error screen is a worse outcome than not
+         trying. The reason goes on the Blue card. */
       state.playAttempt = 'FAILED: ' + ((e && e.message) ? e.message : 'unknown');
     });
   }
 
-  /* boot() runs once per PAGE LOAD. If the site appends play=1 with
-   * history.pushState instead of navigating - which a single-page site
-   * typically does - then boot has already run against the old url and the
-   * play request never arrives. Checking once was a gap whatever else is
-   * wrong, so the url is watched instead of sampled.
-   *
-   * Driven from the nav tick that already runs, so there is no second timer,
-   * and guarded by playTriedFor so one navigation produces one attempt rather
-   * than one per tick. */
+  /* The play row can appear at any moment: on load, after a pushState, or
+   * when the site renders it late. boot() runs once, so it is watched from
+   * the nav tick that already runs. playTriedFor holds the url already
+   * attempted, so one row produces one attempt rather than one per tick. */
   function playWatchTick() {
     if (state.tookOver) { return; }
-    var href = '';
-    try { href = W.location.href || ''; } catch (e) { return; }
-    if (href === state.playTriedFor) { return; }
-
-    var req = playRequestFromUrl();
-    if (!req) { return; }
-
-    state.playTriedFor = href;
-    tryInlinePlay(req);
+    var u = playUrlOnPage();
+    if (!u || u === state.playTriedFor) { return; }
+    state.playTriedFor = u;
+    tryInlinePlay(u);
   }
-
   function boot() {
     var forced = devOpenRequest();
     if (forced) { CFG.open = forced; bootFetch(); return; }
@@ -2954,11 +2844,7 @@
     // The site plays inline on the detail page, so this is the real trigger.
     // Runs AFTER navStart so the page stays usable while the fetch is in
     // flight, and takes over only if the fetch succeeds.
-    var inlinePlay = playRequestFromUrl();
-    if (inlinePlay) {
-      try { state.playTriedFor = W.location.href || ''; } catch (e) {}
-      tryInlinePlay(inlinePlay);
-    }
+    playWatchTick();   // the play row may already be here
   }
 
   function bootFetch() {
