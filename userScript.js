@@ -76,7 +76,7 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.6.2';
+  var BUILD_VERSION = '0.6.3';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
@@ -151,6 +151,19 @@
     var n = D.createElement(tag);
     if (css) n.style.cssText = css;
     if (text != null) n.textContent = text;
+    /* Tag EVERYTHING this module builds, here at the factory.
+     *
+     * The body guard hides children of <body> that we did not create, to keep
+     * the site's chrome off our player. buildUi() tagged what existed at
+     * takeover - but the settings panel, subtitle picker, delay box and
+     * diagnostics are built later, on a keypress, and were therefore hidden
+     * the instant they appeared. On the Frame that looked exactly like a dead
+     * remote: the keys worked, and their output was being erased.
+     *
+     * Tagging at creation rather than at a moment in time is what makes that
+     * unrepeatable - a pane added next year is covered without anyone
+     * remembering this. */
+    try { n.setAttribute('data-mbp-own', '1'); } catch (e) {}
     return n;
   }
   function fmt(t) {
