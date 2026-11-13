@@ -1,13 +1,27 @@
 /*!
- * MBP Native Player - vertical slice
+ * MBP Native Player -- movieboxpro.app on a Samsung TV, driven by the remote
  *
- * Proves the whole chain end to end on one hard-coded title:
+ * Two jobs in one page load, and no mode switch between them:
  *
- *   session cookies -> POST /index/index/player?tfid=
- *   -> parse qualityLevels out of the HTML
- *   -> pick a rung -> <video src>
+ *   1. BROWSING. The site is built for touch, so nothing on it is reachable
+ *      with a D-pad. This draws a highlight over the page's own controls and
+ *      moves it with the arrow keys, so the site's existing pages -- sign-in,
+ *      search, a series' episode list -- work from the sofa.
+ *
+ *   2. PLAYING. The moment the page produces player data, navigation shuts
+ *      down and the screen is taken over by a plain <video> element with its
+ *      own overlay: quality, subtitles, resume, next episode, diagnostics.
+ *      The site's own player is never driven; it is replaced.
+ *
+ * The handover is the whole design: one page load, one owner of the keys at a
+ * time, and no flag the viewer can see or get stuck in.
+ *
+ * While playing, it does its own source lookup and bookkeeping:
+ *
+ *   parse qualityLevels out of the page -> pick a rung -> <video src>
  *   -> <track> from /index/index/get_srt_content?...&format=vtt&delay=
- *   -> D-pad control -> POST /index/index/tv_progress
+ *   -> progress to /index/index/{tv,movie}_progress
+ *   -> on expiry or wake, re-fetch /index/index/player and resume in place
  *
  * A TizenBrew *site mod*, not an app module, and that is deliberate: the site
  * sends no Access-Control-Allow-Origin, so a module on http://127.0.0.1:8081
@@ -15,12 +29,29 @@
  * call same-origin and sends the session cookies automatically. See
  * DELIVERY.md section 0.
  *
- * It takes the page over rather than driving the site's own player.
- *
  * Plain ES5, no build step, no dependencies.
  *
- * Keys:  OK/Play pause-play | Left/Right seek 10s | FF/RW seek 60s
- *        Up/Down pick quality | Red subtitles on/off | Back exit
+ * Keys, browsing:
+ *   Arrows   move the highlight        OK     activate what is highlighted
+ *   Blue     help, and page size       Back   back, or leave at the first page
+ *
+ * Keys, playing:
+ *   OK       tap to pause, HOLD for settings
+ *   Up/Down  settings (the same panel -- holding OK is untested on real
+ *            hardware, so nothing is reachable only that way)
+ *   Left/Right  seek 10s               FF/RW  seek 60s
+ *   Green    settings, on subtitles    Red    subtitles on/off
+ *   Blue     diagnostics               Back   leave the player
+ *
+ * Settings holds quality, subtitles, subtitle delay, next episode and
+ * diagnostics. Up/Down chooses a row, Left/Right changes it, Back closes.
+ *
+ * This header describes the shape, not the state. Anything that changes from
+ * release to release -- what has been tried on a TV, what is still unverified,
+ * what the open questions are -- lives in DELIVERY.md and TEST.md, because the
+ * version of this comment that said "vertical slice" and "one hard-coded
+ * title" stayed in the published file for six releases after both had stopped
+ * being true. A status claim in a header is a status claim nobody updates.
  */
 (function () {
   'use strict';
@@ -45,12 +76,12 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.4.2';
+  var BUILD_VERSION = '0.4.3';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
   // which is itself worth seeing on the diagnostics screen.
-  var BUILD_SHA = '96a10d4';
+  var BUILD_SHA = 'dev';
   var BUILD_SRC = (function () {
     try {
       var s = D.currentScript;
@@ -445,6 +476,7 @@
   var state = {
     // session-scoped: survives an episode change (see endEpisode)
     wired: false, progressTimer: null, subOn: true, tookOver: false,
+    guard: null, hidden: 0,
     okHeld: false,
     wakeTimer: null, lastTick: 0, wasPlaying: false,
     pairing: false, pairExpired: false, pairTimer: null,
@@ -463,14 +495,20 @@
     s.textContent =
       'html,body{margin:0;height:100%;background:#000;overflow:hidden;' +
       'font:16px/1.4 system-ui,Arial,sans-serif;color:#fff}' +
-      '#v{position:fixed;inset:0;width:100%;height:100%;background:#000;object-fit:contain}' +
+      // Explicit layers. buildUi() wipes the document, but the SITE'S SCRIPTS
+      // ARE STILL RUNNING and keep inserting their own player chrome into the
+      // fresh body. Without a z-index those late arrivals win on document
+      // order alone, which is what put the site's controls over ours.
+      // 1 video, 30 panes, 40 the full-screen message. The settings panel and
+      // focus ring already carry their own, higher, values.
+      '#v{position:fixed;inset:0;width:100%;height:100%;background:#000;object-fit:contain;z-index:1}' +
       '#v::cue{font-size:2.2vw;background:rgba(0,0,0,.55)}' +
-      '.pane{position:fixed;left:0;right:0;padding:40px 60px;' +
+      '.pane{position:fixed;left:0;right:0;padding:40px 60px;z-index:30;' +
       'transition:opacity .25s;background:linear-gradient(transparent,rgba(0,0,0,.85))}' +
       '#osd{bottom:0}' +
       '#bar{height:6px;background:rgba(255,255,255,.25);border-radius:3px;margin:14px 0 8px}' +
       '#fill{height:100%;width:0;background:#7fd0ff;border-radius:3px}' +
-      '#msg{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;' +
+      '#msg{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;' +
       'flex-direction:column;gap:14px;text-align:center;padding:40px;background:#000}' +
       '.dim{color:#8fa3b8;font-size:14px}' +
       '.big{font-size:30px;font-weight:700;color:#7fd0ff}';
@@ -495,6 +533,43 @@
 
     ui.msg = el('div'); ui.msg.id = 'msg';
     D.body.appendChild(ui.msg);
+
+    markOurs();
+    guardBody();
+  }
+
+  /* Tag everything this module owns, so the guard can tell ours from theirs
+   * without maintaining a list that will drift the moment anyone adds a pane. */
+  var OURS = 'data-mbp-own';
+
+  function markOurs() {
+    var i, kids = D.body.childNodes;
+    for (i = 0; i < kids.length; i++) {
+      if (kids[i].nodeType === 1) { kids[i].setAttribute(OURS, '1'); }
+    }
+  }
+
+  /* Anything added to <body> after the takeover that we did not tag is site
+   * chrome arriving late. Count it as well as hide it: a number on the
+   * diagnostics screen turns 'the controls look wrong' into something
+   * measurable, which is how the last four bugs actually got found. */
+  function guardBody() {
+    if (!W.MutationObserver) { return; }
+    try {
+      state.guard = new W.MutationObserver(function (recs) {
+        var i, j, n;
+        for (i = 0; i < recs.length; i++) {
+          for (j = 0; j < recs[i].addedNodes.length; j++) {
+            n = recs[i].addedNodes[j];
+            if (n.nodeType !== 1) { continue; }
+            if (n.getAttribute && n.getAttribute(OURS)) { continue; }
+            try { n.style.display = 'none'; } catch (e) {}
+            state.hidden++;
+          }
+        }
+      });
+      state.guard.observe(D.body, { childList: true });
+    } catch (e) {}
   }
 
   function showMsg() {
@@ -770,8 +845,10 @@
     state.rung = index;
 
     if (/\.m3u8(\?|$)/i.test(src.src) && !canPlay('application/vnd.apple.mpegurl')) {
-      showMsg('This rung is HLS and this browser has no native HLS.',
-              el('div', null, 'The slice plays progressive .mp4 only; hls.js is the next step.'));
+      showMsg('This quality needs HLS, which this TV\'s browser cannot play.',
+              el('div', null, 'Hold OK and pick a different quality.'),
+              el('div', 'color:#8fa3b8;font-size:14px',
+                 'Only progressive .mp4 qualities work here for now.'));
       return;
     }
 
@@ -966,6 +1043,34 @@
   }
 
   // --------------------------------------------------------- next episode
+  /* Release the media pipeline BEFORE navigating.
+   *
+   * Setting location.href while <video> is still decoding can leave the
+   * engine waiting on a pipeline that never tears down - the page unloads and
+   * the next one never paints. On a TV that is a dead set with no way out but
+   * the home key, and it is what 'Back goes to loading forever' was.
+   *
+   * pause -> drop the source -> load() to force the reset -> detach, then
+   * navigate on the next tick so the engine has actually let go first.
+   * Every step is wrapped: a failure here must not strand the user on a
+   * player they cannot leave, so navigation happens regardless. */
+  function leaveToSite(href) {
+    try {
+      var v = ui.video;
+      if (v) {
+        try { v.pause(); } catch (e1) {}
+        try { v.removeAttribute('src'); } catch (e2) {}
+        try { while (v.firstChild) { v.removeChild(v.firstChild); } } catch (e3) {}
+        try { v.load(); } catch (e4) {}
+        try { if (v.parentNode) { v.parentNode.removeChild(v); } } catch (e5) {}
+      }
+      if (state.guard) { try { state.guard.disconnect(); } catch (e6) {} }
+    } catch (e) {}
+    setTimeout(function () {
+      try { W.location.href = href; } catch (err) {}
+    }, 0);
+  }
+
   function playNext() {
     var d = state.data;
     if (!d || !d.tid) return;
@@ -1088,7 +1193,8 @@
           return;
         }
         showMsg('Playback failed' + (e ? ' (code ' + e.code + ')' : ''),
-                el('div', 'color:#8fa3b8;font-size:14px', 'Press Up or Down to try another quality.'));
+                el('div', 'color:#8fa3b8;font-size:14px',
+                   'Hold OK for settings, then change Quality with Left/Right.'));
       });
       state.progressTimer = setInterval(saveProgress, CFG.progressEvery);
       startHeartbeat();
@@ -1636,8 +1742,8 @@
     else if (a === 'blue') toggleDiag();
     else if (a === 'green') openSubPanel();
     else if (a === 'next') playNext();
-    else if (a === 'prev') osd('Previous episode not in the slice yet');
-    else if (a === 'back') { saveProgress(); try { W.location.href = '/'; } catch (err) {} }
+    else if (a === 'prev') osd('Previous episode is not wired up -- press Back for the list');
+    else if (a === 'back') { saveProgress(); leaveToSite('/'); }
   }
 
   /* ================================================================ navigation
