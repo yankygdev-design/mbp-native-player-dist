@@ -76,7 +76,7 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.6.0';
+  var BUILD_VERSION = '0.6.1';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
@@ -2751,15 +2751,16 @@
    * four releases of guessing at it from photographs. The page does the work
    * for us and always did:
    *
-   *     <li class="play" oss_download_url="/index/index/player?mfid=456177">
-   *     <li class="play" oss_download_url="/index/index/player?tfid=854459">
+   *     <li class="play" oss_download_url="/index/index/player?mfid=NNNNNN">
+   *     <li class="play" oss_download_url="/index/index/player?tfid=NNNNNN">
    *
    * The complete request - endpoint, parameter name, id - is sitting in an
    * attribute. POSTing it returns the same HTML fragment the parser already
    * reads: 582 KB carrying both qualityLevels and sources.
    *
    * Everything this replaces was unnecessary. The id in the path is NOT the
-   * id the player wants (/movie/13600 plays mfid=456177), the episode list
+   * id the player wants - a film at /movie/<path id> plays a DIFFERENT
+   * mfid - the episode list
    * never needed walking, and player_tv_episodes never needed calling. The
    * site names the parameter correctly for the type, so films and series are
    * the same code path.
