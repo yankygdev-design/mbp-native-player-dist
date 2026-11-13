@@ -76,7 +76,7 @@
   // and it exposes whether an immutable tag or a cache-prone branch was used.
   //
   // Must be read at top level: currentScript is null once anything async runs.
-  var BUILD_VERSION = '0.5.0';
+  var BUILD_VERSION = '0.5.1';
   // A commit cannot contain its own hash, so this is a placeholder in source
   // and is rewritten by tools/sync-dist.js with the SHA of the commit the
   // published copy was cut from. 'dev' therefore means "running from source",
@@ -479,6 +479,9 @@
     guard: null, hidden: 0,
     // what the inline-play attempt did, reported on the Blue card
     playAttempt: 'not attempted',
+    // the href the attempt was made for, so a single-page navigation is
+    // noticed once and not retried every tick
+    playTriedFor: '',
     okHeld: false,
     wakeTimer: null, lastTick: 0, wasPlaying: false,
     pairing: false, pairExpired: false, pairTimer: null,
@@ -2604,6 +2607,7 @@
     nav.pick = setInterval(function () {
       if (!nav.on) { clearInterval(nav.pick); nav.pick = null; return; }
       navBadge();   // pages replace their body; the stamp has to survive that
+      playWatchTick();   // the url can change without a page load
       if (nav.focus && navAttached(nav.focus) && navShown(nav.focus)) {
         navStuckTick(true);
         navDrawRing();
@@ -2819,14 +2823,12 @@
 
   function tryInlinePlay(req) {
     state.playAttempt = 'resolving ' + req.kind + ' ' + req.id;
-    L.info('play', state.playAttempt);
 
     resolvePlayable(req).then(function (p) {
       state.playAttempt = 'fetching (' + (p.note || '') + ')';
       return fetchPlayer(p, 0).then(function (txt) {
         if (state.tookOver) { return; }      // something else got there first
         state.playAttempt = 'took over';
-        L.info('play', 'player data fetched; taking over');
         navStop();
         buildUi();
         D.addEventListener('keydown', onKey, true);
@@ -2839,8 +2841,29 @@
     })['catch'](function (e) {
       // Leave the site's player running. Record why, and say so on the card.
       state.playAttempt = 'FAILED: ' + ((e && e.message) ? e.message : 'unknown');
-      L.warn('play', state.playAttempt);
     });
+  }
+
+  /* boot() runs once per PAGE LOAD. If the site appends play=1 with
+   * history.pushState instead of navigating - which a single-page site
+   * typically does - then boot has already run against the old url and the
+   * play request never arrives. Checking once was a gap whatever else is
+   * wrong, so the url is watched instead of sampled.
+   *
+   * Driven from the nav tick that already runs, so there is no second timer,
+   * and guarded by playTriedFor so one navigation produces one attempt rather
+   * than one per tick. */
+  function playWatchTick() {
+    if (state.tookOver) { return; }
+    var href = '';
+    try { href = W.location.href || ''; } catch (e) { return; }
+    if (href === state.playTriedFor) { return; }
+
+    var req = playRequestFromUrl();
+    if (!req) { return; }
+
+    state.playTriedFor = href;
+    tryInlinePlay(req);
   }
 
   function boot() {
@@ -2853,7 +2876,10 @@
     // Runs AFTER navStart so the page stays usable while the fetch is in
     // flight, and takes over only if the fetch succeeds.
     var inlinePlay = playRequestFromUrl();
-    if (inlinePlay) { tryInlinePlay(inlinePlay); }
+    if (inlinePlay) {
+      try { state.playTriedFor = W.location.href || ''; } catch (e) {}
+      tryInlinePlay(inlinePlay);
+    }
   }
 
   function bootFetch() {
